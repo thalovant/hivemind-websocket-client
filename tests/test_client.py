@@ -1,19 +1,23 @@
 """Tests for hivemind_bus_client.client — BinaryDataCallbacks, Waiters, HiveMessageBusClient."""
-import json
 import ssl
 import unittest
 from threading import Event
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 from ovos_bus_client.message import Message
 
 from hivemind_bus_client.client import (
     BinaryDataCallbacks,
+    HiveMessageBusClient,
     HiveMessageWaiter,
     HivePayloadWaiter,
-    HiveMessageBusClient,
 )
-from hivemind_bus_client.message import HiveMessage, HiveMessageType, HiveMindBinaryPayloadType
+from hivemind_bus_client.message import (
+    HiveMessage,
+    HiveMessageType,
+    HiveMindBinaryPayloadType,
+)
+from hivemind_bus_client.noise import NoiseTransportFailed
 
 
 class TestBinaryDataCallbacks(unittest.TestCase):
@@ -79,8 +83,8 @@ class TestHivePayloadWaiter(unittest.TestCase):
 
 def _make_client(**kwargs):
     """Create HiveMessageBusClient without actually connecting or starting threads."""
-    from pyee import EventEmitter
     from ovos_utils.fakebus import FakeBus
+    from pyee import EventEmitter
 
     defaults = {
         "key": "test-key",
@@ -96,7 +100,7 @@ def _make_client(**kwargs):
     # Bypass OVOSBusClient.__init__ which starts websocket threads
     client = object.__new__(HiveMessageBusClient)
     client.bin_callbacks = defaults.pop("bin_callbacks", BinaryDataCallbacks())
-    from hivemind_bus_client.encryption import SupportedEncodings, SupportedCiphers
+    from hivemind_bus_client.encryption import SupportedCiphers, SupportedEncodings
     client.json_encoding = SupportedEncodings.JSON_HEX
     client.cipher = SupportedCiphers.AES_GCM
     client.identity = None
@@ -107,9 +111,11 @@ def _make_client(**kwargs):
     client._host = defaults["host"]
     client.init_identity()
     client.crypto_key = defaults.get("crypto_key")
+    client.noise_transport = None
     client.allow_self_signed = True
     client.share_bus = False
     client.handshake_event = Event()
+    client._stop_event = Event()
     client.websocket_ping_interval = defaults["websocket_ping_interval"]
     client.websocket_ping_timeout = defaults["websocket_ping_timeout"]
     client.compress = True
@@ -165,20 +171,94 @@ class TestHiveMessageBusClientOnError(unittest.TestCase):
         client.connected_event.set()
         client.handshake_event.set()
         client.crypto_key = "some-key"
-        client.on_error(Exception("test"))
+        client.noise_transport = MagicMock()
+        error = Exception("test")
+        client.on_error(error)
         self.assertFalse(client.connected_event.is_set())
         self.assertFalse(client.handshake_event.is_set())
         self.assertIsNone(client.crypto_key)
+        self.assertIsNone(client.noise_transport)
+        mock_super_error.assert_not_called()
+        client.emitter.emit.assert_called_once_with("error", error)
+        client.client.close.assert_called_once_with()
+
+    def test_on_error_isolates_listener_failure_and_closes_socket(self):
+        client = _make_client()
+        client.emitter.emit.side_effect = RuntimeError("listener failed")
+
+        client.on_error(Exception("websocket failed"))
+
+        client.client.close.assert_called_once_with()
+
+    def test_on_error_ignores_non_exception_callback(self):
+        client = _make_client()
+        client.connected_event.set()
+        client.handshake_event.set()
+        client.crypto_key = "some-key"
+        client.on_error(MagicMock())
+        self.assertTrue(client.connected_event.is_set())
+        self.assertTrue(client.handshake_event.is_set())
+        self.assertEqual(client.crypto_key, "some-key")
+        client.client.close.assert_not_called()
 
     def test_on_close_clears_handshake(self):
         client = _make_client()
         client.connected_event.set()
         client.handshake_event.set()
         client.crypto_key = "some-key"
+        client.noise_transport = MagicMock()
         client.on_close()
         self.assertFalse(client.connected_event.is_set())
         self.assertFalse(client.handshake_event.is_set())
         self.assertIsNone(client.crypto_key)
+        self.assertIsNone(client.noise_transport)
+        client.emitter.emit.assert_called_once_with("close")
+
+    def test_close_stops_reconnect_and_closes_socket(self):
+        client = _make_client()
+        client.started_running = True
+        client.connected_event.set()
+        client.handshake_event.set()
+        client.close()
+        self.assertTrue(client._stop_event.is_set())
+        # The worker owns this flag and clears it from _run_forever's finally
+        # block after it has actually stopped.
+        self.assertTrue(client.started_running)
+        self.assertFalse(client.connected_event.is_set())
+        self.assertFalse(client.handshake_event.is_set())
+        client.client.close.assert_called_once_with()
+
+    @patch("hivemind_bus_client.client.Thread")
+    def test_run_in_thread_honors_close_before_worker_starts(self, mock_thread):
+        client = _make_client()
+
+        thread = client.run_in_thread()
+        worker = mock_thread.call_args.kwargs["target"]
+        client.close()
+        worker()
+
+        self.assertIs(thread, mock_thread.return_value)
+        mock_thread.assert_called_once_with(
+            target=client._run_forever, daemon=True
+        )
+        thread.start.assert_called_once_with()
+        client.client.run_forever.assert_not_called()
+        self.assertFalse(client.started_running)
+
+
+class TestHiveMessageBusClientOnMessage(unittest.TestCase):
+    def test_invalid_noise_frame_reconnects_instead_of_stopping(self):
+        client = _make_client()
+        client.noise_transport = MagicMock()
+        client.noise_transport.decrypt_frame.side_effect = NoiseTransportFailed(
+            "invalid frame"
+        )
+
+        client.on_message(b"invalid")
+
+        client.noise_transport.decrypt_frame.assert_called_once_with(b"invalid")
+        client.client.close.assert_called_once_with()
+        self.assertFalse(client._stop_event.is_set())
 
 
 class TestHiveMessageBusClientKeepalive(unittest.TestCase):
@@ -224,6 +304,9 @@ class TestHiveMessageBusClientKeepalive(unittest.TestCase):
     def test_run_forever_passes_keepalive(self):
         client = _make_client()
         client.allow_self_signed = False
+        client.client.run_forever.side_effect = (
+            lambda **kwargs: client._stop_event.set()
+        )
         client.run_forever()
         client.client.run_forever.assert_called_once_with(
             ping_interval=25.0, ping_timeout=10.0
@@ -231,11 +314,67 @@ class TestHiveMessageBusClientKeepalive(unittest.TestCase):
 
     def test_run_forever_passes_keepalive_and_ssl_options(self):
         client = _make_client()
+        client.client.run_forever.side_effect = (
+            lambda **kwargs: client._stop_event.set()
+        )
         client.run_forever()
         kwargs = client.client.run_forever.call_args.kwargs
         self.assertEqual(kwargs["ping_interval"], 25.0)
         self.assertEqual(kwargs["ping_timeout"], 10.0)
         self.assertEqual(kwargs["sslopt"]["cert_reqs"], ssl.CERT_NONE)
+
+    def test_run_forever_reconnects_after_websocket_returns(self):
+        client = _make_client()
+        client.allow_self_signed = False
+        client.retry = 0
+        first_socket = client.client
+        second_socket = MagicMock()
+        second_socket.run_forever.side_effect = (
+            lambda **kwargs: client._stop_event.set()
+        )
+        client.create_client = MagicMock(return_value=second_socket)
+
+        client.run_forever()
+
+        first_socket.run_forever.assert_called_once_with(
+            ping_interval=25.0, ping_timeout=10.0
+        )
+        client.create_client.assert_called_once_with()
+        second_socket.run_forever.assert_called_once_with(
+            ping_interval=25.0, ping_timeout=10.0
+        )
+        client.emitter.emit.assert_called_once_with("reconnecting")
+
+    def test_reconnecting_listener_failure_does_not_stop_worker(self):
+        client = _make_client()
+        client.allow_self_signed = False
+        client.retry = 0
+        client.emitter.emit.side_effect = RuntimeError("listener failed")
+        second_socket = MagicMock()
+        second_socket.run_forever.side_effect = (
+            lambda **kwargs: client._stop_event.set()
+        )
+        client.create_client = MagicMock(return_value=second_socket)
+
+        client.run_forever()
+
+        client.emitter.emit.assert_called_once_with("reconnecting")
+        client.create_client.assert_called_once_with()
+        second_socket.run_forever.assert_called_once_with(
+            ping_interval=25.0, ping_timeout=10.0
+        )
+
+    def test_run_forever_does_not_reconnect_after_close(self):
+        client = _make_client()
+        client.allow_self_signed = False
+        client.client.run_forever.side_effect = (
+            lambda **kwargs: client.close()
+        )
+        client.create_client = MagicMock()
+
+        client.run_forever()
+
+        client.create_client.assert_not_called()
 
 
 class TestHiveMessageBusClientOn(unittest.TestCase):

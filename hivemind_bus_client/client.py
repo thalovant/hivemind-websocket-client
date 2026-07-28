@@ -1,28 +1,39 @@
 import json
 import ssl
-from threading import Event
-from typing import Union, Optional, Callable
+from collections.abc import Callable
+from threading import Event, Thread
+from typing import Optional, Union
 
 import pybase64
 from Cryptodome.PublicKey import RSA
-from ovos_bus_client import Message as MycroftMessage, MessageBusClient as OVOSBusClient
+from ovos_bus_client import Message as MycroftMessage
+from ovos_bus_client import MessageBusClient as OVOSBusClient
 from ovos_bus_client.session import Session
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
+from poorman_handshake.asymmetric.utils import load_RSA_key
 from pyee import EventEmitter
-from websocket import ABNF
-from websocket import WebSocketApp, WebSocketConnectionClosedException
+from websocket import ABNF, WebSocketApp, WebSocketConnectionClosedException
 
+from hivemind_bus_client.encryption import (
+    SupportedCiphers,
+    SupportedEncodings,
+    decrypt_bin,
+    decrypt_from_json,
+    encrypt_as_json,
+    encrypt_bin,
+    hybrid_encrypt,
+)
 from hivemind_bus_client.identity import NodeIdentity
 from hivemind_bus_client.keepalive import websocket_keepalive_options
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
-from hivemind_bus_client.serialization import HiveMindBinaryPayloadType
-from hivemind_bus_client.serialization import get_bitstring, decode_bitstring
-from hivemind_bus_client.util import serialize_message
-from hivemind_bus_client.encryption import (encrypt_as_json, decrypt_from_json, encrypt_bin, decrypt_bin,
-                                            SupportedEncodings, SupportedCiphers, hybrid_encrypt)
 from hivemind_bus_client.noise import NoiseTransportFailed
-from poorman_handshake.asymmetric.utils import load_RSA_key, sign_RSA
+from hivemind_bus_client.serialization import (
+    HiveMindBinaryPayloadType,
+    decode_bitstring,
+    get_bitstring,
+)
+from hivemind_bus_client.util import serialize_message
 
 
 class BinaryDataCallbacks:
@@ -132,6 +143,11 @@ class HiveMessageBusClient(OVOSBusClient):
         self.allow_self_signed = self_signed
         self.share_bus = share_bus
         self.handshake_event = Event()
+        # Own the reconnect lifecycle here instead of relying on
+        # ovos-bus-client's recursive on_error -> run_forever callback.  The
+        # latter does not handle a clean websocket close and can leave the
+        # worker thread dead while wait_for_handshake() waits forever.
+        self._stop_event = Event()
         self.websocket_ping_interval = websocket_ping_interval
         self.websocket_ping_timeout = websocket_ping_timeout
 
@@ -245,18 +261,58 @@ class HiveMessageBusClient(OVOSBusClient):
         self.retry = 5
 
     def on_error(self, *args):
-        self.connected_event.clear()
-        self.handshake_event.clear()
-        self.crypto_key = None
-        self.noise_transport = None
-        super().on_error(*args)
+        error = args[0] if len(args) == 1 else args[1]
+        # websocket-client can invoke this callback with a control frame
+        # instead of an exception. It is not a connection failure.
+        if not isinstance(error, BaseException):
+            LOG.debug("ignoring non-exception websocket error callback: %r",
+                      error)
+            return
+
+        self._clear_connection_state()
+        if isinstance(error, WebSocketConnectionClosedException):
+            LOG.warning("HiveMind websocket connection closed unexpectedly")
+        elif isinstance(error, ConnectionRefusedError):
+            LOG.warning("HiveMind websocket connection refused")
+        elif isinstance(error, ConnectionResetError):
+            LOG.warning("HiveMind websocket connection reset")
+        else:
+            LOG.warning("HiveMind websocket error: %r", error)
+            # Event handlers are application callbacks; one faulty listener
+            # must not terminate the reconnect worker.
+            try:
+                self.emitter.emit("error", error)
+            except Exception as emitter_error:  # noqa: BLE001
+                LOG.exception("Failed to emit websocket error event: %s",
+                              emitter_error)
+
+        # A callback exception does not make WebSocketApp.run_forever()
+        # return by itself. Closing only the current socket guarantees that
+        # every real error reaches the outer reconnect loop.
+        try:
+            if self.client.keep_running:
+                self.client.close()
+        except Exception as close_error:  # noqa: BLE001
+            LOG.exception("Failed to close errored websocket: %s",
+                          close_error)
 
     def on_close(self, *args):
+        self._clear_connection_state()
+        self.emitter.emit("close")
+
+    def _clear_connection_state(self):
         self.connected_event.clear()
         self.handshake_event.clear()
         self.crypto_key = None
         self.noise_transport = None
-        super().on_close(*args)
+
+    def close(self):
+        """Permanently stop reconnecting and close the websocket."""
+        self._stop_event.set()
+        try:
+            self.client.close()
+        finally:
+            self._clear_connection_state()
 
     def wait_for_handshake(self, timeout=5, max_retries=None):
         """
@@ -300,7 +356,21 @@ class HiveMessageBusClient(OVOSBusClient):
         return WebSocketApp(url, on_open=self.on_open, on_close=self.on_close,
                             on_error=self.on_error, on_message=self.on_message)
 
+    def run_in_thread(self):
+        """Launch the reconnect lifecycle in a daemon thread."""
+        # Clear before spawning so close() cannot be overwritten by a worker
+        # that has been scheduled but has not started yet.
+        self._stop_event.clear()
+        thread = Thread(target=self._run_forever, daemon=True)
+        thread.start()
+        return thread
+
     def run_forever(self):
+        """Run the reconnect lifecycle on the calling thread."""
+        self._stop_event.clear()
+        self._run_forever()
+
+    def _run_forever(self):
         self.started_running = True
         run_options = self._websocket_keepalive_options()
         if self.allow_self_signed:
@@ -308,7 +378,29 @@ class HiveMessageBusClient(OVOSBusClient):
                 "cert_reqs": ssl.CERT_NONE,
                 "check_hostname": False,
                 "ssl_version": ssl.PROTOCOL_TLS_CLIENT}
-        self.client.run_forever(**run_options)
+        try:
+            while not self._stop_event.is_set():
+                self.client.run_forever(**run_options)
+                self._clear_connection_state()
+                if self._stop_event.is_set():
+                    break
+
+                delay = self.retry
+                LOG.warning("HiveMind websocket disconnected; reconnecting "
+                            "in %.1f seconds", delay)
+                if self._stop_event.wait(delay):
+                    break
+
+                self.retry = min(self.retry * 2, 60)
+                try:
+                    self.emitter.emit("reconnecting")
+                except Exception as emitter_error:  # noqa: BLE001
+                    LOG.exception("Failed to emit websocket reconnecting "
+                                  "event: %s", emitter_error)
+                self.client = self.create_client()
+        finally:
+            self.started_running = False
+            self._clear_connection_state()
 
     def _websocket_keepalive_options(self):
         return websocket_keepalive_options(
@@ -337,7 +429,10 @@ class HiveMessageBusClient(OVOSBusClient):
                 # receive counter is now out of sync so the session is dead
                 LOG.exception("rejecting invalid Noise transport message, "
                               "closing connection")
-                self.close()
+                # Close this connection so run_forever() establishes a fresh
+                # Noise session. Public close() is reserved for an intentional
+                # permanent shutdown.
+                self.client.close()
                 return
         elif self.crypto_key:
             # handle binary encryption
