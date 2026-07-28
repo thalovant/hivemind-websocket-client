@@ -218,8 +218,9 @@ class HiveMindSlaveProtocol:
         if self.identity is None:
             self.identity = self.hm.identity or NodeIdentity()
         self.handshake = HandShake(self.identity.private_key)
-        self.pswd_handshake = (PasswordHandShake(self.identity.password, min_bits=_pw_min_bits())
-                               if self.identity.password else None)
+        # PasswordHandShake is a legacy (v2) mechanism. Build it only after
+        # the server explicitly selects that fallback in handle_handshake();
+        # validating it here would apply v2 policy before v3 Noise negotiation.
 
         if bus is None:
             bus = MessageBusClient()

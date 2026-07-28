@@ -32,6 +32,8 @@ from hivemind_bus_client.identity import NodeIdentity
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivescope import TopologyBuilder
 
+ASYNC_MATRIX_PASSWORD = "async-matrix-horse-battery-staple-92"
+
 
 async def _wait_for(condition, timeout: float = 10.0, interval: float = 0.05) -> bool:
     loop = asyncio.get_event_loop()
@@ -63,7 +65,7 @@ def _make_async_client(url, key, password, name="v3-async-client",
     )
 
 
-def _master(key="async-matrix-key", password="async-matrix-pwd",
+def _master(key="async-matrix-key", password=ASYNC_MATRIX_PASSWORD,
             allowed_types=("recognizer_loop:utterance",)):
     b = TopologyBuilder()
     m = b.add_master("M0", use_loopback=True)
@@ -101,7 +103,8 @@ async def test_async_v3_client_v3_server_noise_session_round_trip():
     try:
         b.start_all()
         client = _make_async_client(m.network_protocol.url,
-                                    "async-matrix-key", "async-matrix-pwd")
+                                    "async-matrix-key",
+                                    ASYNC_MATRIX_PASSWORD)
         # would hang forever before the fix
         await asyncio.wait_for(client.connect(site_id="matrix-site"), timeout=15)
         # protocol v3 negotiated: Noise transport replaces the v2 AES session
@@ -121,7 +124,8 @@ async def test_async_v3_client_v2_server_negotiates_down_to_legacy(monkeypatch):
     try:
         b.start_all()
         client = _make_async_client(m.network_protocol.url,
-                                    "async-matrix-key", "async-matrix-pwd")
+                                    "async-matrix-key",
+                                    ASYNC_MATRIX_PASSWORD)
         await asyncio.wait_for(client.connect(site_id="matrix-site"), timeout=15)
         # legacy (v2) handshake: AES session key, no Noise transport
         assert client.crypto_key is not None

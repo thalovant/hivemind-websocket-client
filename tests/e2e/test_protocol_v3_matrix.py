@@ -23,6 +23,10 @@ from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_bus_client.protocol import HiveMindSlaveProtocol
 from hivescope import TopologyBuilder
 
+MATRIX_PASSWORD = "matrix-horse-battery-staple-92"
+RIGHT_PASSWORD = "right-horse-battery-staple-92"
+WRONG_PASSWORD = "wrong-horse-battery-staple-93"
+
 
 def _wait_for(condition, timeout: float = 10.0, interval: float = 0.05) -> bool:
     deadline = time.monotonic() + timeout
@@ -53,7 +57,7 @@ def _make_client(url, key, password, name="v3-matrix-client",
     )
 
 
-def _master(key="matrix-key", password="matrix-pwd",
+def _master(key="matrix-key", password=MATRIX_PASSWORD,
             allowed_types=("recognizer_loop:utterance",)):
     b = TopologyBuilder()
     m = b.add_master("M0", use_loopback=True)
@@ -92,7 +96,8 @@ def test_v3_client_v3_server_noise_session_round_trip():
     b, m = _master()
     try:
         b.start_all()
-        client = _make_client(m.network_protocol.url, "matrix-key", "matrix-pwd")
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              MATRIX_PASSWORD)
         client.connect(site_id="matrix-site")
         client.wait_for_handshake(timeout=10)
         # protocol v3 negotiated: Noise transport replaces the v2 AES session
@@ -113,7 +118,8 @@ def test_v3_client_v2_server_negotiates_down_to_legacy(monkeypatch):
     b, m = _master()
     try:
         b.start_all()
-        client = _make_client(m.network_protocol.url, "matrix-key", "matrix-pwd")
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              MATRIX_PASSWORD)
         client.connect(site_id="matrix-site")
         client.wait_for_handshake(timeout=10)
         # legacy (v2) handshake: AES session key, no Noise transport
@@ -129,7 +135,8 @@ def test_v2_client_v3_server_uses_legacy_handshake():
     b, m = _master()
     try:
         b.start_all()
-        client = _make_client(m.network_protocol.url, "matrix-key", "matrix-pwd",
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              MATRIX_PASSWORD,
                               max_protocol_version=2)
         client.connect(site_id="matrix-site")
         client.wait_for_handshake(timeout=10)
@@ -145,11 +152,11 @@ def test_v2_client_v3_server_uses_legacy_handshake():
 
 
 def test_wrong_password_v3_handshake_fails_fast():
-    b, m = _master(password="right-password")
+    b, m = _master(password=RIGHT_PASSWORD)
     try:
         b.start_all()
         client = _make_client(m.network_protocol.url, "matrix-key",
-                              "wrong-password")
+                              WRONG_PASSWORD)
         with pytest.raises(Exception):
             client.connect(site_id="matrix-site", handshake_max_retries=1)
         # PSK mismatch aborts cryptographically: no session of either kind,
@@ -160,6 +167,28 @@ def test_wrong_password_v3_handshake_fails_fast():
         assert not any("v3-matrix-client" in p for p in m.connected_peers())
         client.close()
     finally:
+        b.stop_all()
+
+
+def test_server_rejects_weak_password_before_noise_session():
+    """Deferring the client object does not bypass server credential policy."""
+    weak_password = "sat123"
+    b, m = _master(password=weak_password)
+    client = None
+    try:
+        b.start_all()
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              weak_password)
+        client.retry = 0.01
+        with pytest.raises(RuntimeError, match="timed out waiting for handshake"):
+            client.connect(site_id="matrix-site", handshake_max_retries=0)
+        assert not client.handshake_event.is_set()
+        assert client.noise_transport is None
+        assert client.crypto_key is None
+        assert not any("v3-matrix-client" in p for p in m.connected_peers())
+    finally:
+        if client is not None:
+            client.close()
         b.stop_all()
 
 
@@ -181,7 +210,8 @@ def test_tampered_negotiation_aborts_handshake(monkeypatch):
     b, m = _master()
     try:
         b.start_all()
-        client = _make_client(m.network_protocol.url, "matrix-key", "matrix-pwd")
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              MATRIX_PASSWORD)
         with pytest.raises(Exception):
             client.connect(site_id="matrix-site", handshake_max_retries=1)
         assert not client.handshake_event.is_set()
@@ -199,7 +229,8 @@ def test_replayed_v3_transport_message_is_rejected():
     b, m = _master()
     try:
         b.start_all()
-        client = _make_client(m.network_protocol.url, "matrix-key", "matrix-pwd")
+        client = _make_client(m.network_protocol.url, "matrix-key",
+                              MATRIX_PASSWORD)
         client.connect(site_id="matrix-site")
         client.wait_for_handshake(timeout=10)
         assert client.noise_transport is not None

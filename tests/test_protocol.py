@@ -7,6 +7,7 @@ from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_bus_client.protocol import CascadeAggregator, HiveMindSlaveProtocol
 from hivemind_bus_client.hive_map import HiveMapper, NodeInfo
 from hivemind_bus_client.identity import NodeIdentity
+from poorman_handshake.symmetric.strength import WeakPasswordError
 
 
 def _make_protocol() -> HiveMindSlaveProtocol:
@@ -18,6 +19,30 @@ def _make_protocol() -> HiveMindSlaveProtocol:
     identity.password = "test-node-horse-battery-staple-92"
     proto = HiveMindSlaveProtocol(hm=hm, identity=identity, site_id="living-room")
     return proto
+
+
+class TestHandshakeInitialization:
+    def test_bind_defers_legacy_password_validation(self):
+        """Binding must not construct a handshake that may never be used."""
+        proto = _make_protocol()
+        proto.identity.password = "sat123"
+        bus = MagicMock()
+
+        with patch("hivemind_bus_client.protocol.HandShake"):
+            proto.bind(bus)
+
+        assert proto.pswd_handshake is None
+
+    def test_legacy_password_handshake_still_rejects_weak_password(self):
+        """The negotiated legacy path must retain its strength policy."""
+        proto = _make_protocol()
+        proto.identity.password = "sat123"
+        message = HiveMessage(HiveMessageType.HANDSHAKE,
+                              {"password": True})
+
+        with patch.object(proto, "_should_use_noise", return_value=False):
+            with pytest.raises(WeakPasswordError):
+                proto.handle_handshake(message)
 
 
 class TestHandlePing:
