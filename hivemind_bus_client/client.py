@@ -392,7 +392,11 @@ class HiveMessageBusClient(OVOSBusClient):
                     break
 
                 self.retry = min(self.retry * 2, 60)
-                self.emitter.emit("reconnecting")
+                try:
+                    self.emitter.emit("reconnecting")
+                except Exception as emitter_error:  # noqa: BLE001
+                    LOG.exception("Failed to emit websocket reconnecting "
+                                  "event: %s", emitter_error)
                 self.client = self.create_client()
         finally:
             self.started_running = False

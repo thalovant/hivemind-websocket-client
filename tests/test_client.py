@@ -345,6 +345,25 @@ class TestHiveMessageBusClientKeepalive(unittest.TestCase):
         )
         client.emitter.emit.assert_called_once_with("reconnecting")
 
+    def test_reconnecting_listener_failure_does_not_stop_worker(self):
+        client = _make_client()
+        client.allow_self_signed = False
+        client.retry = 0
+        client.emitter.emit.side_effect = RuntimeError("listener failed")
+        second_socket = MagicMock()
+        second_socket.run_forever.side_effect = (
+            lambda **kwargs: client._stop_event.set()
+        )
+        client.create_client = MagicMock(return_value=second_socket)
+
+        client.run_forever()
+
+        client.emitter.emit.assert_called_once_with("reconnecting")
+        client.create_client.assert_called_once_with()
+        second_socket.run_forever.assert_called_once_with(
+            ping_interval=25.0, ping_timeout=10.0
+        )
+
     def test_run_forever_does_not_reconnect_after_close(self):
         client = _make_client()
         client.allow_self_signed = False
