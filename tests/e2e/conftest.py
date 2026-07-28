@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import tempfile
 
+import pytest
+
 
 _xdg_tempdir = None
 
@@ -40,6 +42,28 @@ def pytest_configure(config):
     server_cfg_dir.mkdir(parents=True, exist_ok=True)
     (server_cfg_dir / "server.json").write_text(
         json.dumps({"min_protocol_version": 0}))
+
+
+@pytest.fixture(autouse=True)
+def isolated_identity_storage(monkeypatch):
+    """Force NodeIdentity below the process-wide temporary config root."""
+    import hivemind_bus_client.identity as identity_module
+    from json_database import JsonConfigXDG
+
+    # JsonConfigXDG binds its default xdg_folder when json_database is
+    # imported, before pytest_configure changes the environment. Patch the
+    # constructor used by NodeIdentity so collection order can never redirect
+    # an e2e client back to the developer's real identity file.
+    identity_config_root = Path(os.environ["XDG_CONFIG_HOME"])
+
+    def isolated_identity_config(name, *args, **kwargs):
+        """Construct an identity config below this test's XDG root."""
+        kwargs["xdg_folder"] = identity_config_root
+        return JsonConfigXDG(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        identity_module, "JsonConfigXDG", isolated_identity_config
+    )
 
 
 def pytest_unconfigure(config):
