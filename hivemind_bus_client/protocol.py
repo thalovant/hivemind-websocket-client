@@ -503,7 +503,8 @@ class HiveMindSlaveProtocol:
             self.receive_handshake(envelope)
             LOG.debug(f"Encoding: {self.hm.json_encoding}")
             LOG.debug(f"Cipher: {self.hm.cipher}")
-            LOG.debug(f"Key size: {len(self.pswd_handshake.secret) * 8}bit")
+            active_handshake = self.pswd_handshake or self.handshake
+            LOG.debug(f"Key size: {len(active_handshake.secret) * 8}bit")
 
         # master is requesting handshake start
         else:
@@ -769,7 +770,7 @@ class HiveMindSlaveProtocol:
                 private_key = load_RSA_key(self.identity.private_key)
                 decrypted = hybrid_decrypt(private_key, pload).decode("utf-8")
                 message._payload = HiveMessage.deserialize(decrypted)
-            except Exception as e:
+            except Exception:
                 if k:
                     LOG.error("failed to decrypt INTERCOM message!")
                 else:

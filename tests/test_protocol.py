@@ -44,6 +44,20 @@ class TestHandshakeInitialization:
             with pytest.raises(WeakPasswordError):
                 proto.handle_handshake(message)
 
+    def test_pubkey_envelope_logs_asymmetric_handshake_key_size(self):
+        """Pubkey fallback must not dereference the absent password handshake."""
+        proto = _make_protocol()
+        proto.handshake = MagicMock(secret=b"k" * 32)
+        message = HiveMessage(HiveMessageType.HANDSHAKE,
+                              {"envelope": "pubkey-envelope"})
+
+        with patch.object(proto, "receive_handshake") as receive:
+            with patch("hivemind_bus_client.protocol.LOG.debug") as debug:
+                proto.handle_handshake(message)
+
+        receive.assert_called_once_with("pubkey-envelope")
+        debug.assert_any_call("Key size: 256bit")
+
 
 class TestHandlePing:
     def test_sends_responsive_ping(self):
