@@ -53,7 +53,8 @@ from hivemind_bus_client.keepalive import websocket_keepalive_options
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_bus_client.serialization import (HiveMindBinaryPayloadType,
                                                decode_bitstring, get_bitstring)
-from hivemind_bus_client.util import serialize_message
+from hivemind_bus_client.util import (get_hivemind_wire_message,
+                                      serialize_message)
 
 
 _MISSING_WEBSOCKETS = (
@@ -518,6 +519,7 @@ class AsyncHiveMessageBusClient:
                 # also surface to internal-bus subscribers
                 self.internal_bus.emit(message.payload)
 
+            message = get_hivemind_wire_message(message)
             LOG.debug(f"sending to HiveMind: {message.msg_type}")
 
             binarize = False

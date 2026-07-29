@@ -1,4 +1,5 @@
 """Tests for hivemind_bus_client.client — BinaryDataCallbacks, Waiters, HiveMessageBusClient."""
+import json
 import ssl
 import unittest
 from threading import Event
@@ -418,6 +419,32 @@ class TestHandleHiveProtocol(unittest.TestCase):
         msg = HiveMessage(HiveMessageType.PING, {"flood_id": "x"})
         client._handle_hive_protocol(msg)
         client.emitter.emit.assert_called()
+
+
+class TestHiveMessageBusClientEmit(unittest.TestCase):
+    def test_modern_bus_topic_uses_one_legacy_wire_message(self):
+        client = _make_client()
+        client.connected_event.set()
+        client.protocol = MagicMock(binarize=False)
+        client.internal_bus = MagicMock()
+
+        client.emit(Message(
+            "ovos.utterance.handle",
+            {"utterances": ["Quelle heure est-il?"], "lang": "fr-fr"},
+        ))
+
+        local = client.internal_bus.emit.call_args.args[0]
+        self.assertEqual(local.msg_type, "ovos.utterance.handle")
+        client.client.send.assert_called_once()
+        wire = json.loads(client.client.send.call_args.args[0])
+        self.assertEqual(
+            wire["payload"]["type"],
+            "recognizer_loop:utterance",
+        )
+        self.assertEqual(
+            wire["payload"]["data"]["utterances"],
+            ["Quelle heure est-il?"],
+        )
 
 
 class TestHandleBinary(unittest.TestCase):

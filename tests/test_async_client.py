@@ -231,6 +231,29 @@ async def test_emit_injects_routing_context():
 
 
 @pytest.mark.asyncio
+async def test_modern_bus_topic_uses_one_legacy_wire_message():
+    bus = _bare_client()
+    bus._ws = AsyncMock()
+    bus.connected_event.set()
+    local = []
+    bus.internal_bus.on(
+        "ovos.utterance.handle",
+        lambda message: local.append(message),
+    )
+
+    await bus.emit(MycroftMessage(
+        "ovos.utterance.handle",
+        {"utterances": ["Quelle heure est-il?"], "lang": "fr-fr"},
+    ))
+
+    assert len(local) == 1
+    bus._ws.send.assert_awaited_once()
+    wire = json.loads(bus._ws.send.await_args.args[0])
+    assert wire["payload"]["type"] == "recognizer_loop:utterance"
+    assert wire["payload"]["data"]["utterances"] == ["Quelle heure est-il?"]
+
+
+@pytest.mark.asyncio
 async def test_emit_raises_when_disconnected_and_never_started():
     bus = _bare_client()
     bus._ws = AsyncMock()

@@ -19,7 +19,10 @@ from hivemind_bus_client.identity import NodeIdentity
 from hivemind_bus_client.message import HiveMessage, HiveMessageType, HiveMindBinaryPayloadType
 from hivemind_bus_client.protocol import HiveMindSlaveProtocol
 from hivemind_bus_client.serialization import get_bitstring, decode_bitstring
-from hivemind_bus_client.util import serialize_message
+from hivemind_bus_client.util import (
+    get_hivemind_wire_message,
+    serialize_message,
+)
 from poorman_handshake.asymmetric.utils import encrypt_RSA, load_RSA_key, sign_RSA
 
 
@@ -298,6 +301,7 @@ class HiveMindHTTPClient(threading.Thread):
             ctxt["session"]["site_id"] = self.site_id
             message.payload.context = ctxt
 
+        message = get_hivemind_wire_message(message)
         LOG.debug(f"sending to HiveMind: {message.msg_type}")
         binarize = False
         if message.msg_type == HiveMessageType.BINARY:
@@ -452,4 +456,3 @@ if __name__ == "__main__":
         answered.wait()
         print(answer)
         answered.clear()
-

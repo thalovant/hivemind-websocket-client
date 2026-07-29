@@ -68,6 +68,48 @@ def test_client_emit_reaches_master_agent_bus():
         b.stop_all()
 
 
+def test_modern_ovos_topic_uses_legacy_acl_once():
+    """A modern local topic crosses the legacy HiveMind BUS contract once."""
+    b = TopologyBuilder()
+    m = b.add_master("M0", use_loopback=True)
+    m.register_satellite(
+        "rt-key",
+        password=ROUND_TRIP_PASSWORD,
+        allowed_types=["recognizer_loop:utterance"],
+    )
+    try:
+        b.start_all()
+        client = _make_client(
+            m.network_protocol.url,
+            "rt-key",
+            ROUND_TRIP_PASSWORD,
+        )
+        client.connect(site_id="loopback-site")
+        client.wait_for_handshake(timeout=10)
+
+        local = []
+        remote = []
+        client.on_mycroft("ovos.utterance.handle", local.append)
+        m.agent_protocol.bus.on("recognizer_loop:utterance", remote.append)
+
+        client.emit(Message(
+            "ovos.utterance.handle",
+            {"utterances": ["Quelle heure est-il?"], "lang": "fr-fr"},
+        ))
+
+        assert _wait_for(lambda: len(remote) == 1), (
+            "modern OVOS topic did not cross the legacy HiveMind ACL"
+        )
+        time.sleep(0.25)
+        assert len(local) == 1
+        assert len(remote) == 1
+        assert remote[0].data["utterances"] == ["Quelle heure est-il?"]
+
+        client.close()
+    finally:
+        b.stop_all()
+
+
 def test_master_to_client_bus_message():
     """A master-side send_to_satellite reaches the client's hive bus."""
     b = TopologyBuilder()
@@ -82,7 +124,9 @@ def test_master_to_client_bus_message():
         time.sleep(0.5)
 
         received = []
+        received_modern = []
         client.on_mycroft("speak", received.append)
+        client.on_mycroft("ovos.utterance.speak", received_modern.append)
 
         peer = next(p for p in m.connected_peers() if p.startswith("downstream"))
         m.send_to_satellite(peer, HiveMessage(
@@ -92,6 +136,11 @@ def test_master_to_client_bus_message():
 
         assert _wait_for(lambda: len(received) >= 1), "speak never reached client"
         assert received[0].data["utterance"] == "hi from master"
+        assert _wait_for(lambda: len(received_modern) >= 1), (
+            "legacy HiveMind speak was not modernized for OVOS"
+        )
+        assert len(received_modern) == 1
+        assert received_modern[0].data["utterance"] == "hi from master"
         client.close()
     finally:
         b.stop_all()

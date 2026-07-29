@@ -8,8 +8,66 @@ import warnings
 import zlib
 from typing import Dict, Union
 
+from ovos_spec_tools import NamespaceTranslator
+
 from hivemind_bus_client.encryption import SupportedEncodings, SupportedCiphers
 from hivemind_bus_client.message import HiveMessage, HiveMessageType, Message
+
+
+_HIVEMIND_WIRE_TRANSLATOR = NamespaceTranslator(
+    modernize=False,
+    emit_legacy=True,
+)
+
+
+def get_hivemind_wire_message(message: HiveMessage) -> HiveMessage:
+    """Return the single message that should cross the HiveMind wire.
+
+    OVOS services use current message-spec topics internally, while the
+    HiveMind BUS ACL and agent protocol use the legacy topic namespace as
+    their stable wire contract. Translate only the outbound BUS payload and
+    leave the caller's message unchanged. This deliberately returns one
+    message instead of mirroring both topic names across the network.
+
+    Args:
+        message: HiveMind message prepared for transport.
+
+    Returns:
+        A copy with a legacy BUS payload when ``message`` carries a migrated
+        OVOS topic, otherwise the original message.
+    """
+    if message.msg_type != HiveMessageType.BUS:
+        return message
+
+    payload = message.payload
+    counterparts = _HIVEMIND_WIRE_TRANSLATOR.counterpart_topics(
+        payload.msg_type
+    )
+    if not counterparts:
+        return message
+
+    wire_type = counterparts[0]
+    wire_payload = Message(
+        wire_type,
+        _HIVEMIND_WIRE_TRANSLATOR.translate_payload(
+            payload.msg_type,
+            wire_type,
+            payload.data,
+        ),
+        dict(payload.context),
+    )
+    return HiveMessage(
+        msg_type=message.msg_type,
+        payload=wire_payload,
+        node=message.node_id,
+        source_peer=message.source_peer,
+        route=message.route,
+        target_peers=message.target_peers,
+        target_site_id=message.target_site_id,
+        target_pubkey=message.target_public_key,
+        bin_type=message.bin_type,
+        metadata=dict(message.metadata),
+    )
 
 
 def serialize_message(message: Union[HiveMessage, Message, Dict]) -> str:

@@ -9,6 +9,7 @@ from hivemind_bus_client.util import (
     cast2bytes, bytes2str,
     serialize_message, get_payload, get_hivemsg, get_mycroft_msg,
     payload2dict,
+    get_hivemind_wire_message,
     encrypt_as_json, decrypt_from_json, encrypt_bin, decrypt_bin,
 )
 
@@ -85,6 +86,42 @@ class TestSerializeMessage(unittest.TestCase):
         d = {"key": "value"}
         s = serialize_message(d)
         self.assertIsInstance(s, str)
+
+
+class TestGetHiveMindWireMessage(unittest.TestCase):
+    def test_modern_bus_topic_is_translated_to_legacy(self):
+        original = HiveMessage(
+            HiveMessageType.BUS,
+            Message(
+                "ovos.utterance.handle",
+                {"utterances": ["Quelle heure est-il?"], "lang": "fr-fr"},
+                {"source": "satellite"},
+            ),
+            metadata={"trace": "test"},
+            target_site_id="kitchen",
+        )
+
+        wire = get_hivemind_wire_message(original)
+
+        self.assertEqual(original.payload.msg_type, "ovos.utterance.handle")
+        self.assertEqual(wire.payload.msg_type, "recognizer_loop:utterance")
+        self.assertEqual(wire.payload.data, original.payload.data)
+        self.assertEqual(wire.payload.context, original.payload.context)
+        self.assertEqual(wire.metadata, {"trace": "test"})
+        self.assertEqual(wire.target_site_id, "kitchen")
+
+    def test_legacy_bus_topic_is_not_duplicated(self):
+        original = HiveMessage(
+            HiveMessageType.BUS,
+            Message("recognizer_loop:utterance", {"utterances": ["hello"]}),
+        )
+
+        self.assertIs(get_hivemind_wire_message(original), original)
+
+    def test_non_bus_message_is_unchanged(self):
+        original = HiveMessage(HiveMessageType.PING, {"flood_id": "test"})
+
+        self.assertIs(get_hivemind_wire_message(original), original)
 
 
 class TestGetPayload(unittest.TestCase):

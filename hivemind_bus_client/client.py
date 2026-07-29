@@ -33,7 +33,10 @@ from hivemind_bus_client.serialization import (
     decode_bitstring,
     get_bitstring,
 )
-from hivemind_bus_client.util import serialize_message
+from hivemind_bus_client.util import (
+    get_hivemind_wire_message,
+    serialize_message,
+)
 
 
 class BinaryDataCallbacks:
@@ -544,6 +547,7 @@ class HiveMessageBusClient(OVOSBusClient):
                 # also send event to client registered handlers
                 self.internal_bus.emit(message.payload)
 
+            message = get_hivemind_wire_message(message)
             LOG.debug(f"sending to HiveMind: {message.msg_type}")
             binarize = False
             if message.msg_type == HiveMessageType.BINARY:
