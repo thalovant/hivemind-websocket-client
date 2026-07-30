@@ -151,10 +151,7 @@ class HiveMessageBusClient(OVOSBusClient):
         # ovos-bus-client's recursive on_error -> run_forever callback.  The
         # latter does not handle a clean websocket close and can leave the
         # worker thread dead while wait_for_handshake() waits forever.
-        self._stop_event = Event()
-        self._worker_lock = Lock()
-        self._worker_token: object | None = None
-        self._worker_thread: Thread | None = None
+        self._init_worker_lifecycle()
         self.websocket_ping_interval = websocket_ping_interval
         self.websocket_ping_timeout = websocket_ping_timeout
 
@@ -178,6 +175,13 @@ class HiveMessageBusClient(OVOSBusClient):
         host = self._host.replace("ws://", "").replace("wss://", "").strip()
         super().__init__(host=host, port=self._port, ssl=use_ssl,
                          emitter=EventEmitter(), session=sess)
+
+    def _init_worker_lifecycle(self) -> None:
+        """Initialize reconnect-worker ownership state."""
+        self._stop_event = Event()
+        self._worker_lock = Lock()
+        self._worker_token: object | None = None
+        self._worker_thread: Thread | None = None
 
     def init_identity(self, site_id=None):
         self.identity = self.identity or NodeIdentity()
@@ -277,6 +281,10 @@ class HiveMessageBusClient(OVOSBusClient):
             return
 
         self._clear_connection_state()
+        # Closed/refused/reset are expected reconnect triggers. Log them
+        # without emitting pyee's special "error" event, which raises when no
+        # application listener is registered. Unclassified failures remain
+        # observable to application error listeners below.
         if isinstance(error, WebSocketConnectionClosedException):
             LOG.warning("HiveMind websocket connection closed unexpectedly")
         elif isinstance(error, ConnectionRefusedError):
@@ -441,7 +449,7 @@ class HiveMessageBusClient(OVOSBusClient):
                 if self._stop_event.wait(delay):
                     break
 
-                self.retry = min(self.retry * 2, 60)
+                self.retry = min(max(self.retry, 1) * 2, 60)
                 try:
                     self.emitter.emit("reconnecting")
                 except Exception as emitter_error:  # noqa: BLE001

@@ -2,10 +2,11 @@
 import json
 import ssl
 import unittest
-from threading import Event, Lock
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 from ovos_bus_client.message import Message
+from websocket import WebSocketConnectionClosedException
 
 from hivemind_bus_client.client import (
     BinaryDataCallbacks,
@@ -117,10 +118,7 @@ def _make_client(**kwargs):
     client.share_bus = False
     client.handshake_event = Event()
     client.protocol = None
-    client._stop_event = Event()
-    client._worker_lock = Lock()
-    client._worker_token = None
-    client._worker_thread = None
+    client._init_worker_lifecycle()
     client.websocket_ping_interval = defaults["websocket_ping_interval"]
     client.websocket_ping_timeout = defaults["websocket_ping_timeout"]
     client.compress = True
@@ -194,6 +192,20 @@ class TestHiveMessageBusClientOnError(unittest.TestCase):
         client.on_error(Exception("websocket failed"))
 
         client.client.close.assert_called_once_with()
+
+    def test_on_error_keeps_expected_reconnect_failures_internal(self):
+        for error in (
+                WebSocketConnectionClosedException(),
+                ConnectionRefusedError(),
+                ConnectionResetError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                client = _make_client()
+
+                client.on_error(error)
+
+                client.emitter.emit.assert_not_called()
+                client.client.close.assert_called_once_with()
 
     def test_on_error_ignores_non_exception_callback(self):
         client = _make_client()
@@ -431,6 +443,7 @@ class TestHiveMessageBusClientKeepalive(unittest.TestCase):
             ping_interval=25.0, ping_timeout=10.0
         )
         client.emitter.emit.assert_called_once_with("reconnecting")
+        self.assertEqual(client.retry, 2)
 
     def test_reconnecting_listener_failure_does_not_stop_worker(self):
         client = _make_client()
