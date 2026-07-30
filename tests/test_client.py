@@ -2,7 +2,7 @@
 import json
 import ssl
 import unittest
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import MagicMock, patch
 
 from ovos_bus_client.message import Message
@@ -118,6 +118,9 @@ def _make_client(**kwargs):
     client.handshake_event = Event()
     client.protocol = None
     client._stop_event = Event()
+    client._worker_lock = Lock()
+    client._worker_token = None
+    client._worker_thread = None
     client.websocket_ping_interval = defaults["websocket_ping_interval"]
     client.websocket_ping_timeout = defaults["websocket_ping_timeout"]
     client.compress = True
@@ -238,16 +241,96 @@ class TestHiveMessageBusClientOnError(unittest.TestCase):
 
         thread = client.run_in_thread()
         worker = mock_thread.call_args.kwargs["target"]
+        worker_args = mock_thread.call_args.kwargs["args"]
         client.close()
-        worker()
+        worker(*worker_args)
 
         self.assertIs(thread, mock_thread.return_value)
         mock_thread.assert_called_once_with(
-            target=client._run_forever, daemon=True
+            target=client._run_worker,
+            args=worker_args,
+            daemon=True,
         )
         thread.start.assert_called_once_with()
         client.client.run_forever.assert_not_called()
         self.assertFalse(client.started_running)
+        self.assertIsNone(client._worker_token)
+        self.assertIsNone(client._worker_thread)
+
+    @patch("hivemind_bus_client.client.Thread")
+    def test_duplicate_run_in_thread_is_rejected_while_stopping(
+            self, mock_thread):
+        client = _make_client()
+
+        client.run_in_thread()
+        worker = mock_thread.call_args.kwargs["target"]
+        worker_args = mock_thread.call_args.kwargs["args"]
+        client.close()
+
+        with self.assertRaisesRegex(RuntimeError, "already running"):
+            client.run_in_thread()
+
+        self.assertTrue(client._stop_event.is_set())
+        mock_thread.assert_called_once()
+
+        # Once the original worker has observed close() and exited, an
+        # explicit restart may claim a fresh lifecycle.
+        worker(*worker_args)
+        self.assertIsNone(client._worker_token)
+
+    @patch("hivemind_bus_client.client.Thread")
+    def test_run_forever_is_rejected_while_thread_worker_is_active(
+            self, mock_thread):
+        client = _make_client()
+
+        client.run_in_thread()
+        worker = mock_thread.call_args.kwargs["target"]
+        worker_args = mock_thread.call_args.kwargs["args"]
+
+        with self.assertRaisesRegex(RuntimeError, "already running"):
+            client.run_forever()
+
+        mock_thread.assert_called_once()
+        client.close()
+        worker(*worker_args)
+
+    def test_live_worker_rejects_duplicate_start_until_exit(self):
+        client = _make_client()
+        worker_entered = Event()
+        release_worker = Event()
+
+        def _block_socket(**kwargs):
+            worker_entered.set()
+            release_worker.wait(timeout=1)
+
+        client.client.run_forever.side_effect = _block_socket
+        thread = client.run_in_thread()
+        self.assertTrue(worker_entered.wait(timeout=1))
+
+        with self.assertRaisesRegex(RuntimeError, "already running"):
+            client.run_in_thread()
+
+        client.close()
+        release_worker.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(client._worker_token)
+        self.assertIsNone(client._worker_thread)
+
+    @patch("hivemind_bus_client.client.Thread")
+    def test_worker_start_failure_releases_lifecycle(self, mock_thread):
+        client = _make_client()
+        mock_thread.return_value.start.side_effect = RuntimeError(
+            "thread start failed"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+            client.run_in_thread()
+
+        self.assertTrue(client._stop_event.is_set())
+        self.assertIsNone(client._worker_token)
+        self.assertIsNone(client._worker_thread)
 
 
 class TestHiveMessageBusClientOnMessage(unittest.TestCase):

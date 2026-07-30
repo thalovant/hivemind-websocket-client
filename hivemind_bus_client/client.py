@@ -1,7 +1,7 @@
 import json
 import ssl
 from collections.abc import Callable
-from threading import Event, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Optional, Union
 
 import pybase64
@@ -152,6 +152,9 @@ class HiveMessageBusClient(OVOSBusClient):
         # latter does not handle a clean websocket close and can leave the
         # worker thread dead while wait_for_handshake() waits forever.
         self._stop_event = Event()
+        self._worker_lock = Lock()
+        self._worker_token: object | None = None
+        self._worker_thread: Thread | None = None
         self.websocket_ping_interval = websocket_ping_interval
         self.websocket_ping_timeout = websocket_ping_timeout
 
@@ -314,7 +317,11 @@ class HiveMessageBusClient(OVOSBusClient):
 
     def close(self):
         """Permanently stop reconnecting and close the websocket."""
-        self._stop_event.set()
+        # Serialize the stop request with worker reservation. A worker that is
+        # already shutting down retains ownership until its finally block, so
+        # a second starter cannot clear this event and revive it.
+        with self._worker_lock:
+            self._stop_event.set()
         try:
             self.client.close()
         finally:
@@ -362,19 +369,56 @@ class HiveMessageBusClient(OVOSBusClient):
         return WebSocketApp(url, on_open=self.on_open, on_close=self.on_close,
                             on_error=self.on_error, on_message=self.on_message)
 
-    def run_in_thread(self):
+    def run_in_thread(self) -> Thread:
         """Launch the reconnect lifecycle in a daemon thread."""
-        # Clear before spawning so close() cannot be overwritten by a worker
-        # that has been scheduled but has not started yet.
-        self._stop_event.clear()
-        thread = Thread(target=self._run_forever, daemon=True)
-        thread.start()
+        token = self._reserve_worker()
+        try:
+            thread = Thread(
+                target=self._run_worker, args=(token,), daemon=True
+            )
+            self._set_worker_thread(token, thread)
+            thread.start()
+        except Exception:
+            self._stop_event.set()
+            self._release_worker(token)
+            raise
         return thread
 
-    def run_forever(self):
+    def run_forever(self) -> None:
         """Run the reconnect lifecycle on the calling thread."""
-        self._stop_event.clear()
-        self._run_forever()
+        token = self._reserve_worker()
+        self._set_worker_thread(token, current_thread())
+        self._run_worker(token)
+
+    def _reserve_worker(self) -> object:
+        """Claim exclusive ownership of the reconnect lifecycle."""
+        with self._worker_lock:
+            if self._worker_token is not None:
+                raise RuntimeError(
+                    "HiveMind websocket reconnect worker is already running"
+                )
+            token = object()
+            self._worker_token = token
+            self._worker_thread = None
+            self._stop_event.clear()
+            return token
+
+    def _set_worker_thread(self, token: object, thread: Thread) -> None:
+        with self._worker_lock:
+            if self._worker_token is token:
+                self._worker_thread = thread
+
+    def _release_worker(self, token: object) -> None:
+        with self._worker_lock:
+            if self._worker_token is token:
+                self._worker_token = None
+                self._worker_thread = None
+
+    def _run_worker(self, token: object) -> None:
+        try:
+            self._run_forever()
+        finally:
+            self._release_worker(token)
 
     def _run_forever(self):
         self.started_running = True
