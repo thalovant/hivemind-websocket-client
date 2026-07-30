@@ -241,6 +241,23 @@ class HiveMindSlaveProtocol:
         self.hm.on(HiveMessageType.BUS, self.handle_bus)
         self.hm.on(HiveMessageType.HANDSHAKE, self.handle_handshake)
 
+    def reset_connection_state(self):
+        """Discard handshake state owned by the closed websocket.
+
+        A socket can close between Noise messages. Reusing that partial
+        handshake on the replacement socket would make the next server
+        negotiation envelope look like a malformed Noise response.
+        """
+        self.handshake = HandShake(self.identity.private_key)
+        self.pswd_handshake = None
+        self.mpubkey = ""
+        self.noise_handshake = None
+        self._noise_pattern = None
+        self._server_hello_payload = None
+        self._server_handshake_payload = None
+        if self.internal_protocol is not None:
+            self.internal_protocol.node_id = ""
+
     @property
     def node_id(self):
         # this is how ovos-core bus refers to this slave's master

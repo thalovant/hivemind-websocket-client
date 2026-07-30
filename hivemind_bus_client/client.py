@@ -146,6 +146,7 @@ class HiveMessageBusClient(OVOSBusClient):
         self.allow_self_signed = self_signed
         self.share_bus = share_bus
         self.handshake_event = Event()
+        self.protocol = None
         # Own the reconnect lifecycle here instead of relying on
         # ovos-bus-client's recursive on_error -> run_forever callback.  The
         # latter does not handle a clean websocket close and can leave the
@@ -308,6 +309,8 @@ class HiveMessageBusClient(OVOSBusClient):
         self.handshake_event.clear()
         self.crypto_key = None
         self.noise_transport = None
+        if self.protocol is not None:
+            self.protocol.reset_connection_state()
 
     def close(self):
         """Permanently stop reconnecting and close the websocket."""

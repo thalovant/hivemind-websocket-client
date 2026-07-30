@@ -59,6 +59,32 @@ class TestHandshakeInitialization:
         debug.assert_any_call("Key size: 256bit")
 
 
+class TestConnectionState:
+    @patch("hivemind_bus_client.protocol.HandShake")
+    def test_reset_discards_partial_handshake(self, handshake_cls):
+        proto = _make_protocol()
+        proto.internal_protocol = MagicMock()
+        proto.internal_protocol.node_id = "old-master"
+        proto.pswd_handshake = MagicMock()
+        proto.mpubkey = "old-key"
+        proto.noise_handshake = MagicMock()
+        proto._noise_pattern = "XXpsk2"
+        proto._server_hello_payload = {"node_id": "old-master"}
+        proto._server_handshake_payload = {"noise": {"patterns": ["XXpsk2"]}}
+
+        proto.reset_connection_state()
+
+        handshake_cls.assert_called_once_with(proto.identity.private_key)
+        assert proto.handshake is handshake_cls.return_value
+        assert proto.pswd_handshake is None
+        assert proto.mpubkey == ""
+        assert proto.noise_handshake is None
+        assert proto._noise_pattern is None
+        assert proto._server_hello_payload is None
+        assert proto._server_handshake_payload is None
+        assert proto.internal_protocol.node_id == ""
+
+
 class TestHandlePing:
     def test_sends_responsive_ping(self):
         proto = _make_protocol()
