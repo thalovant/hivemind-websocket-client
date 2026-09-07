@@ -665,8 +665,22 @@ class HiveMindSlaveProtocol:
     def handle_handshake(self, message: HiveMessage):
         LOG.info(f"HANDSHAKE: {message.payload}")
         assert message.msg_type == HiveMessageType.HANDSHAKE
-        # protocol v3: server's Noise handshake message
-        if "noise" in message.payload and self.noise_handshake is not None:
+        # protocol v3: server's Noise handshake message.
+        # Only a Noise handshake MESSAGE carries noise.msg -- the server's
+        # OFFER carries noise.patterns/noise.suites. Dispatching on the mere
+        # presence of "noise" fed a repeated offer to
+        # receive_noise_handshake(), which aborted the handshake as a
+        # malformed envelope and discarded the genuine reply behind it.
+        # A transport may legitimately redeliver the offer: the HTTP
+        # protocol queues per access key and re-sends HELLO + offer from
+        # handle_new_client() whenever /connect finds no cached connection,
+        # so a failed attempt leaves an offer queued for the next one.
+        noise = message.payload.get("noise")
+        if isinstance(noise, dict) and self.noise_handshake is not None:
+            if "msg" not in noise:
+                LOG.debug("ignoring a repeated HANDSHAKE offer received "
+                          "while the Noise handshake is in flight")
+                return
             self.receive_noise_handshake(message.payload)
             return
         # master is performing the handshake
