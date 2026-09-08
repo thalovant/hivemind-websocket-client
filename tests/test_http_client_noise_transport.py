@@ -109,3 +109,56 @@ def test_close_connection_exists_for_abort_noise():
     c.disconnect = MagicMock()
     c.close_connection()
     c.disconnect.assert_called_once()
+
+
+def test_a_send_failure_invalidates_the_session_before_raising():
+    """CWE-345: NoiseTransport advances its send counter per frame. If the
+    POST fails, leaving noise_transport live lets the next emit() reuse a
+    counter the server rejects -- so a failed send must tear the session
+    down, not depend on a later /disconnect."""
+    c = _client(MagicMock())
+    c.handshake_event = threading.Event(); c.handshake_event.set()
+    c.protocol = MagicMock()
+    with patch("hivemind_bus_client.http_client.requests.post") as post:
+        post.return_value.ok = False
+        post.return_value.status_code = 500
+        with pytest.raises(ConnectionError):
+            c._send_noise_frame(b"frame")
+    assert c.noise_transport is None
+    assert not c.connected.is_set()
+    c.protocol.reset_connection_state.assert_called_once()
+
+
+def test_a_send_exception_also_invalidates_the_session():
+    c = _client(MagicMock())
+    c.handshake_event = threading.Event(); c.handshake_event.set()
+    c.protocol = MagicMock()
+    with patch("hivemind_bus_client.http_client.requests.post",
+               side_effect=OSError("connection reset")):
+        with pytest.raises(OSError):
+            c._send_noise_frame(b"frame")
+    assert c.noise_transport is None
+    assert not c.connected.is_set()
+
+
+def test_disconnect_invalidates_even_when_the_request_fails():
+    c = _client(object())
+    c.handshake_event = threading.Event(); c.handshake_event.set()
+    c.protocol = MagicMock()
+    with patch("hivemind_bus_client.http_client.requests.post",
+               side_effect=OSError("timeout")):
+        with pytest.raises(OSError):
+            c.disconnect()
+    assert c.noise_transport is None
+    assert not c.connected.is_set()
+    c.protocol.reset_connection_state.assert_called_once()
+
+
+def test_a_frame_after_the_session_is_invalidated_is_not_processed_cleartext():
+    """208: run() keeps iterating a batch it already drained. After a Noise
+    failure clears connected, the next frame must be skipped, not decoded as
+    cleartext on what was a v3 session."""
+    c = _client(MagicMock())
+    c.connected = threading.Event()  # left un-set == invalidated mid-batch
+    c.on_message(b"a later frame from the same drained batch")
+    c._handle_hive_protocol.assert_not_called()

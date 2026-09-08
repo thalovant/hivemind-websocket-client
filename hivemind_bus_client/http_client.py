@@ -188,6 +188,12 @@ class HiveMindHTTPClient(threading.Thread):
                                "call 'hivemind-client set-identity'")
 
     def on_message(self, message: Union[bytes, str]):
+        # Once a Noise failure has invalidated the session mid-batch, the
+        # run() loop is still iterating the frames it already drained. Without
+        # this guard the next frame would find noise_transport cleared and be
+        # processed as cleartext on what was a v3 session.
+        if not self.connected.is_set():
+            return
         # getattr: subclasses and tests build clients without __init__
         noise_transport = getattr(self, "noise_transport", None)
         if noise_transport is not None:
@@ -439,15 +445,21 @@ class HiveMindHTTPClient(threading.Thread):
         flagged ``binary=1``; the listener decodes it back to the bytes that
         ``HiveMindClientConnection.decode`` requires on a v3 session.
         """
-        response = requests.post(
-            f"{self.base_url}/send_message",
-            data={"message": pybase64.b64encode(frame).decode("utf-8"),
-                  "binary": "1"},
-            params={"authorization": self.auth},
-            timeout=self.http_timeout)
+        try:
+            response = requests.post(
+                f"{self.base_url}/send_message",
+                data={"message": pybase64.b64encode(frame).decode("utf-8"),
+                      "binary": "1"},
+                params={"authorization": self.auth},
+                timeout=self.http_timeout)
+        except Exception:
+            # the send counter has advanced for this frame; a caught error
+            # would otherwise let the next emit() reuse a counter the server
+            # rejects, so tear the session down before propagating
+            self._invalidate_local_session()
+            raise
         if not response.ok:
-            # the send counter has already advanced for this frame; the
-            # session cannot be resynchronised, so say so loudly
+            self._invalidate_local_session()
             raise ConnectionError(
                 f"HiveMind rejected a Noise transport frame: HTTP {response.status_code}")
 
@@ -530,21 +542,32 @@ class HiveMindHTTPClient(threading.Thread):
         self.wait_for_handshake(max_retries=handshake_max_retries)
         return payload
 
-    def disconnect(self) -> dict:
-        """Disconnect from the HiveMind server."""
-        LOG.info("Disconnecting...")
-        url = f"{self.base_url}/disconnect"
-        response = requests.post(url, params={"authorization": self.auth},
-                                 timeout=self.http_timeout)
+    def _invalidate_local_session(self) -> None:
+        """Drop every piece of local session state.
+
+        Called on disconnect and on any send/receive failure. It never depends
+        on a successful ``/disconnect``: a stale ``noise_transport`` would
+        encrypt the next HELLO against a CipherState the server has dropped,
+        and advance a send counter the server rejects.
+        """
         self.connected.clear()
         self.handshake_event.clear()
-        # the next session starts from a fresh handshake; a stale transport
-        # would encrypt its HELLO against a CipherState the server dropped
         self.noise_transport = None
         protocol = getattr(self, "protocol", None)
         if protocol is not None and hasattr(protocol, "reset_connection_state"):
             protocol.reset_connection_state()
-        return response.json()
+
+    def disconnect(self) -> dict:
+        """Disconnect from the HiveMind server."""
+        LOG.info("Disconnecting...")
+        url = f"{self.base_url}/disconnect"
+        try:
+            response = requests.post(url, params={"authorization": self.auth},
+                                     timeout=self.http_timeout)
+            return response.json()
+        finally:
+            # even if the POST times out, the local session must not survive
+            self._invalidate_local_session()
 
     def get_messages(self) -> List[str]:
         """Retrieve messages from the HiveMind server."""
