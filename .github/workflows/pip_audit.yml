@@ -1,11 +1,15 @@
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
 name: PIP Audit
 
 on:
   pull_request:
-    branches: [dev]
+    branches: [dev, master]
   workflow_dispatch:
 
 jobs:
   pip_audit:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@dev
-    secrets: inherit
+    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@5ef51f8a9e67a938b1adde466359b5309d48f5f6 # dev
