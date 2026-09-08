@@ -213,6 +213,37 @@ def _read_psk_cache(path: str) -> Dict[str, Any]:
     return cache if isinstance(cache, dict) else {}
 
 
+#: A Noise PSK is exactly this long; anything else is not a key.
+_PSK_LENGTH = 32
+
+
+def _write_private_json(path: str, payload: dict) -> None:
+    """Write key material so it is never readable by anyone else, even briefly.
+
+    ``open(path, "w")`` followed by ``chmod`` leaves a window in which the file
+    exists with umask permissions and already holds the key. Create it
+    owner-only from the start, in a temporary file, and rename into place so a
+    failed write cannot leave a truncated cache behind.
+    """
+    directory = os.path.dirname(path) or "."
+    temporary = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        # O_CREAT's mode is masked by umask and ignored for an existing file,
+        # so make it 0600 either way before it becomes the real cache.
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def load_cached_psk(key_path: Optional[str], node_id: str) -> Optional[bytes]:
     """The stored PSK for ``node_id``, or None when there is none."""
     path = _psk_cache_path(key_path)
@@ -222,7 +253,11 @@ def load_cached_psk(key_path: Optional[str], node_id: str) -> Optional[bytes]:
         psk = bytes.fromhex(str(_read_psk_cache(path).get(node_id, "")))
     except ValueError:
         return None
-    return psk or None
+    # bytes.fromhex accepts any even-length value; "00" would come back as a
+    # one-byte "hit" and hand invalid key material to the handshake.
+    if len(psk) != _PSK_LENGTH:
+        return None
+    return psk
 
 
 def save_cached_psk(key_path: Optional[str], node_id: str,
@@ -233,7 +268,7 @@ def save_cached_psk(key_path: Optional[str], node_id: str,
     never fail a connection.
     """
     path = _psk_cache_path(key_path)
-    if not path or not node_id or not psk:
+    if not path or not node_id or len(psk) != _PSK_LENGTH:
         return
     try:
         directory = os.path.dirname(path)
@@ -243,12 +278,7 @@ def save_cached_psk(key_path: Optional[str], node_id: str,
         if cache.get(node_id) == psk.hex():
             return
         cache[node_id] = psk.hex()
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        # The mode on open() only applies at creation; an existing file keeps
-        # whatever it had.
-        os.chmod(path, 0o600)
+        _write_private_json(path, cache)
     except OSError:
         LOG.debug("could not persist the Noise PSK cache at %s", path)
 
@@ -330,9 +360,6 @@ def forget_cached_psk(key_path: Optional[str], node_id: str) -> None:
         cache = _read_psk_cache(path)
         if cache.pop(node_id, None) is None:
             return
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.chmod(path, 0o600)
+        _write_private_json(path, cache)
     except OSError:
         LOG.debug("could not update the Noise PSK cache at %s", path)

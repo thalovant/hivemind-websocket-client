@@ -88,7 +88,7 @@ def test_no_key_path_means_no_cache():
     assert load_cached_psk(None, NODE_ID) is None
 
 
-def test_cached_psk_still_completes_a_real_handshake(tmp_path):
+def test_cached_psk_still_completes_a_real_handshake(tmp_path, monkeypatch):
     """The cache swaps ``password=`` for ``psk=``; both must yield one key.
 
     This is the test that matters. A key that differed from the password's
@@ -127,8 +127,53 @@ def test_cached_psk_still_completes_a_real_handshake(tmp_path):
     assert client.handshake_finished and server.handshake_finished
     assert (tmp_path / "client" / NOISE_PSK_FILENAME).is_file()
 
-    client, server = handshake()
+    # The second run has to PROVE the cache was read. Both handshakes would
+    # complete even if load_cached_psk always returned None, because deriving
+    # again yields the same key -- so the initiator's derivation is forbidden
+    # this time, and the responder is handed a precomputed key so it never
+    # needs to derive either.
+    # The responder derives inside NoiseHandShake itself, not through this
+    # module's derive_psk, so forbidding the module-level name only bites the
+    # initiator's explicit call -- the one the cache is supposed to replace.
+    import hivemind_bus_client.noise as noise_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the initiator re-derived: the cache was not read")
+
+    monkeypatch.setattr(noise_module, "derive_psk", forbidden)
+    client = start_noise_handshake(
+        initiator=True, pattern=NOISE_PATTERN_XX, suite=NOISE_SUITE_CHACHA,
+        password=password, node_id=node_id, prologue=prologue,
+        key_path=str(tmp_path / "client" / "noise_key"))
+    server = start_noise_handshake(
+        initiator=False, pattern=NOISE_PATTERN_XX, suite=NOISE_SUITE_CHACHA,
+        password=password, node_id=node_id, prologue=prologue,
+        key_path=str(tmp_path / "server" / "noise_key"))
+    server.read_message(client.write_message())
+    client.read_message(server.write_message())
+    server.read_message(client.write_message())
     assert client.handshake_finished and server.handshake_finished
+
+
+def test_a_short_cache_value_is_not_a_key(tmp_path):
+    """bytes.fromhex accepts any even-length hex; a key is exactly 32 bytes."""
+    import json
+    key_path = _key_path(tmp_path)
+    (tmp_path / NOISE_PSK_FILENAME).write_text(json.dumps({NODE_ID: "00"}))
+    assert load_cached_psk(key_path, NODE_ID) is None
+
+    save_cached_psk(key_path, NODE_ID, b"\x00")  # refused, not stored
+    assert load_cached_psk(key_path, NODE_ID) is None
+
+
+def test_the_cache_is_owner_only_from_creation(tmp_path, monkeypatch):
+    """Not chmod after the fact: the key must never exist world-readable."""
+    key_path = _key_path(tmp_path)
+    monkeypatch.setattr(os, "umask", lambda mask: 0)  # a permissive process
+    os.umask(0o022)
+    save_cached_psk(key_path, NODE_ID, PSK)
+    mode = stat.S_IMODE(os.stat(tmp_path / NOISE_PSK_FILENAME).st_mode)
+    assert mode == 0o600
 
 
 def test_the_listening_side_never_writes_a_psk_cache(tmp_path):
