@@ -1,3 +1,7 @@
+permissions:
+  contents: read
+  pull-requests: write
+
 name: Lint
 
 on:
@@ -7,8 +11,7 @@ on:
 
 jobs:
   lint:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/lint.yml@dev
-    secrets: inherit
+    uses: OpenVoiceOS/gh-automations/.github/workflows/lint.yml@5ef51f8a9e67a938b1adde466359b5309d48f5f6 # dev
     with:
       ruff: true
       pre_commit: false   # set true if .pre-commit-config.yaml exists

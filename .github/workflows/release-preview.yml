@@ -1,14 +1,17 @@
+permissions:
+  contents: read
+  pull-requests: write
+
 name: Release Preview
 
 on:
   pull_request:
-    branches: [dev]
+    branches: [dev, master]
   workflow_dispatch:
 
 jobs:
   release_preview:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/release-preview.yml@dev
-    secrets: inherit
+    uses: OpenVoiceOS/gh-automations/.github/workflows/release-preview.yml@5ef51f8a9e67a938b1adde466359b5309d48f5f6 # dev
     with:
       package_name: 'hivemind_bus_client'
       version_file: 'hivemind_bus_client/version.py'

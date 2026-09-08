@@ -1,14 +1,19 @@
+permissions:
+  # The pinned reusable workflow declares contents:write for its optional
+  # Pages path; GitHub validates that permission even when Pages is disabled.
+  contents: write
+  pull-requests: write
+
 name: Code Coverage
 
 on:
   pull_request:
-    branches: [dev]
+    branches: [dev, master]
   workflow_dispatch:
 
 jobs:
   coverage:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
-    secrets: inherit
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@5ef51f8a9e67a938b1adde466359b5309d48f5f6 # dev
     with:
       python_version: '3.11'
       coverage_source: 'hivemind_bus_client'
