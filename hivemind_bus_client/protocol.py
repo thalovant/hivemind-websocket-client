@@ -395,8 +395,12 @@ class HiveMindSlaveProtocol:
             # rejection may mean the cached key was derived from a password
             # that has since been rotated. Drop it, so the next attempt
             # derives from the current one instead of failing the same way.
-            forget_cached_psk(self.identity.noise_key,
-                              self.internal_protocol.node_id)
+            # Defensively: this is a cleanup path on an already-failed
+            # handshake, so it must not raise and mask the real error.
+            _internal = getattr(self, "internal_protocol", None)
+            _node_id = getattr(_internal, "node_id", None)
+            if _node_id:
+                forget_cached_psk(self.identity.noise_key, _node_id)
             self._abort_noise("Noise handshake authentication failure")
             return
 
