@@ -1,9 +1,0 @@
-poorman-handshake>=1.0.0,<2.0.0
-ovos_bus_client>=0.0.6a19
-ovos_utils>=0.0.38
-bitstring>=4.1.1
-cryptography>=41.0.1
-pycryptodomex>=3.18.0
-pybase64
-py-cpuinfo
-z85base91>=0.0.5,<1.0.0

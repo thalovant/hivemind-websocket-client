@@ -1,14 +1,27 @@
+"""Serialization helpers, payload normalization, and compression utilities.
+
+Also re-exports deprecated encryption wrappers that redirect to
+``hivemind_bus_client.encryption``.
+"""
 import json
+import warnings
 import zlib
-from typing import Union, Dict
+from typing import Dict, Union
 
 from hivemind_bus_client.encryption import SupportedEncodings, SupportedCiphers
 from hivemind_bus_client.message import HiveMessage, HiveMessageType, Message
 
 
 def serialize_message(message: Union[HiveMessage, Message, Dict]) -> str:
-    # convert a Message object into raw data that can be sent over
-    # websocket
+    """Convert a message object to a JSON string suitable for WebSocket transport.
+
+    Args:
+        message: A ``HiveMessage``, ``Message``, dict, or any object with a
+            ``serialize()`` method.
+
+    Returns:
+        JSON string representation of *message*.
+    """
     if hasattr(message, 'serialize'):
         return message.serialize()
     elif isinstance(message, dict):
@@ -21,8 +34,17 @@ def serialize_message(message: Union[HiveMessage, Message, Dict]) -> str:
 
 
 def payload2dict(payload: Union[HiveMessage, Message, str]) -> Dict:
-    """helper to ensure all subobjects of a payload are a dict safe for serialization
-    eg. ensure payload is valid to send over mycroft messagebus object """
+    """Recursively normalize *payload* to a JSON-safe dict.
+
+    Ensures all nested ``HiveMessage`` and ``Message`` sub-objects are
+    converted so the result can be safely sent over the OVOS bus.
+
+    Args:
+        payload: A ``HiveMessage``, ``Message``, JSON string, or dict.
+
+    Returns:
+        A fully-normalized dict.
+    """
     if isinstance(payload, HiveMessage):
         payload = payload.as_dict
     if isinstance(payload, Message):
@@ -30,30 +52,31 @@ def payload2dict(payload: Union[HiveMessage, Message, str]) -> Dict:
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
-        except:
+        except Exception:
             pass
     assert isinstance(payload, dict)
 
-    def can_serialize(val):
-        if isinstance(val, HiveMessage) \
-                or isinstance(val, Message) \
-                or isinstance(val, dict):
-            return True
-        return False
+    def can_serialize(val: object) -> bool:
+        return isinstance(val, (HiveMessage, Message, dict))
 
     for k, v in payload.items():
         if can_serialize(v):
             payload[k] = payload2dict(v)
         if isinstance(v, list):
-            for idx, l in enumerate(v):
-                if can_serialize(l):
-                    payload[k][idx] = payload2dict(l)
+            for idx, item in enumerate(v):
+                if can_serialize(item):
+                    payload[k][idx] = payload2dict(item)
     return payload
 
 
 def get_payload(msg: Union[HiveMessage, Message, str, Dict]) -> Dict:
-    """ helper to read normalized payload
-    from all supported formats (HiveMessage, Message, json str)
+    """Extract a normalized dict payload from any supported message format.
+
+    Args:
+        msg: A ``HiveMessage``, ``Message``, JSON string, or dict.
+
+    Returns:
+        The payload as a plain dict.
     """
     if isinstance(msg, HiveMessage):
         msg = msg.payload
@@ -65,8 +88,13 @@ def get_payload(msg: Union[HiveMessage, Message, str, Dict]) -> Dict:
 
 
 def get_hivemsg(msg: Union[Message, str, Dict]) -> HiveMessage:
-    """ helper to create a normalized HiveMessage object
-    from all supported formats (Message, json str, dict)
+    """Create a normalized ``HiveMessage`` from any supported format.
+
+    Args:
+        msg: A ``Message``, JSON string, or dict with ``HiveMessage`` fields.
+
+    Returns:
+        A ``HiveMessage`` instance.
     """
     if isinstance(msg, str):
         msg = json.loads(msg)
@@ -79,6 +107,14 @@ def get_hivemsg(msg: Union[Message, str, Dict]) -> HiveMessage:
 
 
 def get_mycroft_msg(pload: Union[HiveMessage, str, Dict]) -> Message:
+    """Extract a ``Message`` (OVOS bus message) from a ``HiveMessage`` or raw data.
+
+    Args:
+        pload: A ``HiveMessage`` (must be ``BUS`` type), JSON string, or dict.
+
+    Returns:
+        An OVOS ``Message`` instance.
+    """
     if isinstance(pload, HiveMessage):
         assert pload.msg_type == HiveMessageType.BUS
         pload = pload.payload
@@ -86,7 +122,7 @@ def get_mycroft_msg(pload: Union[HiveMessage, str, Dict]) -> Message:
     if isinstance(pload, str):
         try:
             pload = Message.deserialize(pload)
-        except:
+        except Exception:
             pload = json.loads(pload)
     if isinstance(pload, dict):
         msg_type = pload.get("msg_type") or pload["type"]
@@ -99,7 +135,14 @@ def get_mycroft_msg(pload: Union[HiveMessage, str, Dict]) -> Message:
 
 
 def compress_payload(text: Union[str, bytes]) -> bytes:
-    # Compressing text
+    """Compress *text* using zlib.
+
+    Args:
+        text: UTF-8 string or raw bytes to compress.
+
+    Returns:
+        zlib-compressed bytes.
+    """
     if isinstance(text, str):
         decompressed = text.encode("utf-8")
     else:
@@ -108,10 +151,27 @@ def compress_payload(text: Union[str, bytes]) -> bytes:
 
 
 def decompress_payload(compressed: bytes) -> bytes:
+    """Decompress zlib-compressed *compressed* bytes.
+
+    Args:
+        compressed: zlib-compressed bytes.
+
+    Returns:
+        Decompressed bytes.
+    """
     return zlib.decompress(compressed)
 
 
-def cast2bytes(payload: Union[Dict, str], compressed=False) -> bytes:
+def cast2bytes(payload: Union[Dict, str], compressed: bool = False) -> bytes:
+    """Convert *payload* to bytes, optionally compressing.
+
+    Args:
+        payload: A dict (JSON-serialized first) or string.
+        compressed: If True, zlib-compress the result.
+
+    Returns:
+        The payload as bytes.
+    """
     if isinstance(payload, dict):
         payload = json.dumps(payload)
     if compressed:
@@ -122,7 +182,16 @@ def cast2bytes(payload: Union[Dict, str], compressed=False) -> bytes:
     return payload
 
 
-def bytes2str(payload: bytes, compressed=False) -> str:
+def bytes2str(payload: bytes, compressed: bool = False) -> str:
+    """Convert *payload* bytes to a UTF-8 string, optionally decompressing.
+
+    Args:
+        payload: Raw or zlib-compressed bytes.
+        compressed: If True, decompress before decoding.
+
+    Returns:
+        Decoded UTF-8 string.
+    """
     if compressed:
         return decompress_payload(payload).decode("utf-8")
     else:
@@ -131,10 +200,10 @@ def bytes2str(payload: bytes, compressed=False) -> str:
 
 ###############
 # deprecated
-import warnings
 
-
-def encrypt_as_json(key, data, b64=False) -> str:
+def encrypt_as_json(key: Union[str, bytes], data: Union[str, Dict],
+                    b64: bool = False) -> str:
+    """Deprecated: use ``hivemind_bus_client.encryption.encrypt_as_json``."""
     warnings.warn(
         "encrypt_as_json is deprecated and will be removed in future versions. "
         "Use 'from hivemind_bus_client.encryption import encrypt_as_json' instead",
@@ -146,7 +215,9 @@ def encrypt_as_json(key, data, b64=False) -> str:
     return _ej(key, data, encoding=c, cipher=SupportedCiphers.AES_GCM)
 
 
-def decrypt_from_json(key, data: Union[str, bytes]):
+def decrypt_from_json(key: Union[str, bytes],
+                      data: Union[str, bytes]) -> str:
+    """Deprecated: use ``hivemind_bus_client.encryption.decrypt_from_json``."""
     warnings.warn(
         "decrypt_from_json is deprecated and will be removed in future versions. "
         "Use 'from hivemind_bus_client.encryption import decrypt_from_json' instead",
@@ -159,11 +230,13 @@ def decrypt_from_json(key, data: Union[str, bytes]):
     except Exception as e:
         try:
             return _dj(key, data, encoding=SupportedEncodings.JSON_B64, cipher=SupportedCiphers.AES_GCM)
-        except:
+        except Exception:
             raise e
 
 
-def encrypt_bin(key, data: Union[str, bytes]):
+def encrypt_bin(key: Union[str, bytes],
+                data: Union[str, bytes]) -> bytes:
+    """Deprecated: use ``hivemind_bus_client.encryption.encrypt_bin``."""
     warnings.warn(
         "encrypt_bin is deprecated and will be removed in future versions. "
         "Use 'from hivemind_bus_client.encryption import encrypt_bin' instead",
@@ -174,7 +247,9 @@ def encrypt_bin(key, data: Union[str, bytes]):
     return _eb(key, data, cipher=SupportedCiphers.AES_GCM)
 
 
-def decrypt_bin(key, ciphertext: bytes):
+def decrypt_bin(key: Union[str, bytes],
+                ciphertext: bytes) -> bytes:
+    """Deprecated: use ``hivemind_bus_client.encryption.decrypt_bin``."""
     warnings.warn(
         "decrypt_bin is deprecated and will be removed in future versions. "
         "Use 'from hivemind_bus_client.encryption import decrypt_bin' instead",
@@ -183,19 +258,3 @@ def decrypt_bin(key, ciphertext: bytes):
     )
     from hivemind_bus_client.encryption import decrypt_bin as _db
     return _db(key, ciphertext, SupportedCiphers.AES_GCM)
-
-
-if __name__ == "__main__":
-    k = "*" * 16
-    test = "this is a test text for checking size of encryption and stuff"
-    print(len(test))  # 61
-
-    encjson = encrypt_as_json(k, test, b64=True)
-    # {"ciphertext": "MkTc1LSK3jugt5SXapAeSrD6YWnYdSJ5oqF2bWYcnFpAYgjAgcTFXiKL3wBsqVKY52SkO5mjkqr7i/0A5A==", "tag": "37WNN8e23Mj0LlOxu9cjnQ==", "nonce": "inRwcb0H1Xu6pp80WFeJvg=="}
-    print(len(encjson))  # 174
-    assert decrypt_from_json(k, encjson) == test
-
-    encjson = encrypt_as_json(k, test, b64=False)
-    # {"ciphertext": "64c65bad86a3582097aa4958b7c9555e8bf7deeac6bdf8b5f648cc360aaf50062ae9c635f602b3c66b2de1eece57666b3412a26f55bbd5ace2f601d8c2", "tag": "ce550c1e399c92bb26bf3c171c212e7d", "nonce": "84d045071b05bf005145ce071df0ed41"}
-    print(len(encjson))  # 228
-    assert decrypt_from_json(k, encjson) == test

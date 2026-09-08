@@ -1,7 +1,7 @@
 from os.path import basename, dirname
 from poorman_handshake.asymmetric.utils import export_RSA_key, create_RSA_key
 from json_database import JsonConfigXDG
-from typing import Optional
+from typing import Dict, List, Optional
 
 
 class NodeIdentity:
@@ -149,6 +149,134 @@ class NodeIdentity:
     def default_port(self, val: int):
         """Set the default port for the node."""
         self.IDENTITY_FILE["default_port"] = val
+
+    @property
+    def noise_key(self) -> str:
+        """
+        Get or set the path to the static X25519 private key used by the
+        protocol-v3 Noise handshake (HIVEMIND-CRYPTO-1 §2/§3.4).
+
+        The key is generated and persisted on first use; it must survive
+        restarts so key pinning survives reconnection.
+
+        Returns:
+            str: The path to the Noise static key file.
+        """
+        return self.IDENTITY_FILE.get("noise_key") or \
+            f"{dirname(self.IDENTITY_FILE.path)}/{self.name}_noise.key"
+
+    @noise_key.setter
+    def noise_key(self, val: str):
+        """Set the path to the Noise static X25519 private key file."""
+        self.IDENTITY_FILE["noise_key"] = val
+
+    @property
+    def pinned_noise_keys(self) -> Dict[str, str]:
+        """TOFU-pinned Noise static public keys, node_id → hex pubkey.
+
+        On the first completed XXpsk2 handshake with a peer the learned
+        static key is pinned against the peer's node id; on every later
+        handshake a mismatch is a fatal authentication failure
+        (HIVEMIND-CRYPTO-1 §3.4.5).
+        """
+        return self.IDENTITY_FILE.get("pinned_noise_keys") or {}
+
+    def get_pinned_noise_key(self, node_id: str) -> Optional[str]:
+        """Return the pinned Noise static public key for a node id, if any."""
+        return self.pinned_noise_keys.get(node_id)
+
+    def pin_noise_key(self, node_id: str, pubkey: str) -> None:
+        """Pin (or re-assert) a peer's Noise static public key.
+
+        Args:
+            node_id: The peer's node identifier.
+            pubkey: Hex-encoded X25519 static public key.
+        """
+        keys = self.pinned_noise_keys
+        keys[node_id] = pubkey
+        self.IDENTITY_FILE["pinned_noise_keys"] = keys
+        self.save()
+
+    @property
+    def trusted_keys(self) -> Dict[str, str]:
+        """Get the trusted keys mapping (alias → public key).
+
+        Trusted keys are used to verify the identity of peers in
+        PROPAGATE, CASCADE, and INTERCOM message handling.  Only
+        messages from peers whose public key is in this mapping will
+        be accepted for bus injection.
+
+        Returns:
+            Dict[str, str]: Mapping of human-friendly alias to public key string.
+        """
+        return self.IDENTITY_FILE.get("trusted_keys") or {}
+
+    @trusted_keys.setter
+    def trusted_keys(self, val: Dict[str, str]) -> None:
+        """Replace the entire trusted keys mapping.
+
+        Args:
+            val: New alias → public key mapping.
+        """
+        self.IDENTITY_FILE["trusted_keys"] = dict(val)
+
+    def add_trusted_key(self, alias: str, pubkey: str) -> bool:
+        """Add a public key to the trusted keys mapping.
+
+        Args:
+            alias: Human-friendly name for the peer (e.g. "living-room-hub").
+            pubkey: The public key string to trust.
+
+        Returns:
+            True if the key was added, False if the alias already exists.
+        """
+        keys = self.trusted_keys
+        if alias in keys:
+            return False
+        keys[alias] = pubkey
+        self.IDENTITY_FILE["trusted_keys"] = keys
+        return True
+
+    def remove_trusted_key(self, alias: str) -> bool:
+        """Remove a trusted key by its alias.
+
+        Args:
+            alias: The alias to remove.
+
+        Returns:
+            True if the key was removed, False if the alias was not found.
+        """
+        keys = self.trusted_keys
+        if alias not in keys:
+            return False
+        del keys[alias]
+        self.IDENTITY_FILE["trusted_keys"] = keys
+        return True
+
+    def is_trusted_key(self, pubkey: str) -> bool:
+        """Check whether a public key is in the trusted keys mapping.
+
+        Args:
+            pubkey: The public key string to check.
+
+        Returns:
+            True if the key is trusted.
+        """
+        return pubkey in self.trusted_keys.values()
+
+    def get_trusted_alias(self, pubkey: str) -> Optional[str]:
+        """Look up the alias for a trusted public key.
+
+        Args:
+            pubkey: The public key string to look up.
+
+        Returns:
+            The alias if found, None otherwise.
+        """
+        for alias, key in self.trusted_keys.items():
+            if key == pubkey:
+                return alias
+        return None
 
     def save(self) -> None:
         """

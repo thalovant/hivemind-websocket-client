@@ -1,0 +1,20 @@
+name: Code Coverage
+
+on:
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
+    secrets: inherit
+    with:
+      python_version: '3.11'
+      coverage_source: 'hivemind_bus_client'
+      # e2e is exercised (with hivescope) by build-tests.yml; coverage only
+      # needs the unit suite. Test deps come from the test extra in
+      # pyproject.toml — the single source of truth, nothing pinned here.
+      pre_install_pip: 'pytest-asyncio'
+      test_path: 'tests/ --ignore=tests/e2e'
+      min_coverage: 0

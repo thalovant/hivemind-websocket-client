@@ -1,0 +1,22 @@
+name: Build Tests
+
+on:
+  pull_request:
+    branches: [dev, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: OpenVoiceOS/gh-automations/.github/workflows/build-tests.yml@dev
+    secrets: inherit
+    with:
+      python_versions: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+      install_extras: 'test'
+      # Unit suite only. The v3 client<->core e2e matrix (tests/e2e) needs a
+      # Noise-capable hivemind-core that itself depends on a poorman-2.0
+      # hivemind-bus-client — a circular, unpublishable dependency during the
+      # coordinated v3 rollout. That live matrix runs in the integration
+      # harness (hivescope) once both sides publish; the Noise wire format is
+      # already covered here by the fixture-based unit tests vs the Python
+      # reference. Re-add e2e with a published hivemind-core pin post-release.
+      test_path: 'tests/ --ignore=tests/e2e'

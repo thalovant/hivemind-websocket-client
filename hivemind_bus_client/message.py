@@ -76,6 +76,8 @@ class HiveMessage:
             payload = {"type": payload.msg_type,
                        "data": payload.data,
                        "context": payload.context}
+        elif isinstance(payload, HiveMessage):
+            payload = payload.as_dict
         elif isinstance(payload, str):
             payload = json.loads(payload)
         self._payload = payload or {}
@@ -119,7 +121,7 @@ class HiveMessage:
 
     @property
     def route(self) -> List[str]:
-        return [r for r in self._route if r.get("targets") and r.get("source")]
+        return [r for r in self._route if isinstance(r, dict) and r.get("targets") and r.get("source")]
 
     @property
     def payload(self) -> Union['HiveMessage', Message, dict, bytes]:
@@ -129,7 +131,7 @@ class HiveMessage:
         Depending on this message's msg_type, the payload is returned as a reconstructed `Message`, a reconstructed `HiveMessage`, or the raw stored payload.
         
         Returns:
-            Union[HiveMessage, Message, dict, bytes]: A `Message` when msg_type is BUS or SHARED_BUS; a `HiveMessage` when msg_type is BROADCAST, PROPAGATE, CASCADE, or ESCALATE; otherwise the raw payload (typically a `dict` or `bytes`).
+            Union[HiveMessage, Message, dict, bytes]: A `Message` when msg_type is BUS or SHARED_BUS; a `HiveMessage` when msg_type is BROADCAST, PROPAGATE, CASCADE, ESCALATE, or QUERY; otherwise the raw payload (typically a `dict` or `bytes`).
         """
         if self.msg_type in [HiveMessageType.BUS, HiveMessageType.SHARED_BUS]:
             return Message(self._payload["type"],
@@ -138,7 +140,8 @@ class HiveMessage:
         if self.msg_type in [HiveMessageType.BROADCAST,
                              HiveMessageType.PROPAGATE,
                              HiveMessageType.CASCADE,
-                             HiveMessageType.ESCALATE]:
+                             HiveMessageType.ESCALATE,
+                             HiveMessageType.QUERY]:
             return HiveMessage(**self._payload)
         return self._payload
 
@@ -206,9 +209,10 @@ class HiveMessage:
             try:
                 return HiveMessage(payload["msg_type"], payload["payload"],
                                    metadata=payload.get("metadata", {}),
+                                   route=payload.get("route"),
                                    target_site_id=payload.get("target_site_id"),
                                    target_pubkey=payload.get("target_pubkey"))
-            except:
+            except Exception:
                 pass  # not a hivemind message
 
         if "type" in payload:
@@ -219,7 +223,7 @@ class HiveMessage:
                                    metadata=payload.get("metadata", {}),
                                    target_site_id=payload.get("target_site_id"),
                                    target_pubkey=payload.get("target_pubkey"))
-            except:
+            except Exception:
                 pass  # not a mycroft message
 
         return HiveMessage(HiveMessageType.THIRDPRTY, payload,

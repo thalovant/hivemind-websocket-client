@@ -5,6 +5,7 @@ from inspect import signature
 from bitstring import BitArray, BitStream
 
 from hivemind_bus_client.exceptions import UnsupportedProtocolVersion
+from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType, HiveMessage, HiveMindBinaryPayloadType
 from hivemind_bus_client.util import compress_payload, decompress_payload, cast2bytes, bytes2str
 
@@ -100,7 +101,7 @@ def _decode_bitstring_v1(s):
     binmap = {e: e.value for e in HiveMindBinaryPayloadType}
 
     hive_type = _INT2TYPE.get(s.read(5).uint, 11)
-    compressed = bool(s.read(1))
+    compressed = s.read(1).bool  # note: bool(BitStream) checks length (always True), .bool reads the actual bit
 
     metalen = s.read(8).uint * 8
     meta = s.read(metalen)

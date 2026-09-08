@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hivemind_bus_client"
+dynamic = ["version"]
+description = "Hivemind Websocket Client"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "JarbasAi", email = "jarbasai@mailfence.com"},
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "poorman-handshake>=2.0.0a1,<3.0.0",
+    "ovos_bus_client>=1.3.1,<3.0.0",
+    "ovos_utils>=0.3.0",
+    "bitstring>=4.1.1",
+    "cryptography>=41.0.1",
+    "pycryptodomex>=3.18.0",
+    "pybase64",
+    "py-cpuinfo",
+    "z85base91>=0.0.5,<1.0.0",
+]
+
+[project.optional-dependencies]
+async = ["websockets>=10.0"]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "websockets>=10.0",
+]
+e2e = [
+    "hivescope>=0.5.0a2",
+    # the protocol v3 e2e matrix additionally needs a v3-capable (Noise)
+    # hivemind-core on the master side. It is installed by the build-tests
+    # workflow via pre_install_pip (a git ref), NOT declared here — PyPI
+    # rejects packages whose metadata carries a direct URL dependency.
+    # TODO: replace with a prerelease floor pin once hivemind-core protocol
+    # v3 is released, then add it back here.
+]
+benchmark = [
+    "websockets>=10.0",
+    "psutil>=5.9",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[project.urls]
+Homepage = "https://github.com/JarbasHiveMind/hivemind-websocket-client"
+
+[project.scripts]
+hivemind-client = "hivemind_bus_client.scripts:hmclient_cmds"
+
+[tool.setuptools]
+packages = ["hivemind_bus_client"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hivemind_bus_client.version.VERSION"}
+
+[tool.setuptools.package-data]
+"*" = ["*.txt", "*.md"]

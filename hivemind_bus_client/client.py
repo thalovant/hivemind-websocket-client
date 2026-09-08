@@ -14,13 +14,15 @@ from websocket import ABNF
 from websocket import WebSocketApp, WebSocketConnectionClosedException
 
 from hivemind_bus_client.identity import NodeIdentity
+from hivemind_bus_client.keepalive import websocket_keepalive_options
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_bus_client.serialization import HiveMindBinaryPayloadType
 from hivemind_bus_client.serialization import get_bitstring, decode_bitstring
 from hivemind_bus_client.util import serialize_message
 from hivemind_bus_client.encryption import (encrypt_as_json, decrypt_from_json, encrypt_bin, decrypt_bin,
-                                            SupportedEncodings, SupportedCiphers)
-from poorman_handshake.asymmetric.utils import encrypt_RSA, load_RSA_key, sign_RSA
+                                            SupportedEncodings, SupportedCiphers, hybrid_encrypt)
+from hivemind_bus_client.noise import NoiseTransportFailed
+from poorman_handshake.asymmetric.utils import load_RSA_key, sign_RSA
 
 
 class BinaryDataCallbacks:
@@ -103,8 +105,18 @@ class HiveMessageBusClient(OVOSBusClient):
                  binarize: bool = True,
                  identity: NodeIdentity = None,
                  internal_bus: Optional[OVOSBusClient] = None,
-                 bin_callbacks: BinaryDataCallbacks = BinaryDataCallbacks()):
+                 bin_callbacks: BinaryDataCallbacks = BinaryDataCallbacks(),
+                 websocket_ping_interval: Optional[float] = None,
+                 websocket_ping_timeout: Optional[float] = None,
+                 max_protocol_version: int = 3):
         self.bin_callbacks = bin_callbacks
+        # highest HiveMind protocol version this client will negotiate
+        # (HIVEMIND-WIRE-1 §2). 3 -> Noise handshake when the server also
+        # supports it; servers capped at 2 or lower fall back to the legacy
+        # handshake transparently. Set to 2 to force the legacy handshake.
+        self.max_protocol_version = max_protocol_version
+        # established protocol v3 Noise session (None on v2 and below)
+        self.noise_transport = None
         self.json_encoding = SupportedEncodings.JSON_HEX  # server defaults before it was made configurable
         self.cipher = SupportedCiphers.AES_GCM  # server defaults before it was made configurable
 
@@ -120,6 +132,8 @@ class HiveMessageBusClient(OVOSBusClient):
         self.allow_self_signed = self_signed
         self.share_bus = share_bus
         self.handshake_event = Event()
+        self.websocket_ping_interval = websocket_ping_interval
+        self.websocket_ping_timeout = websocket_ping_timeout
 
         # if you want to reduce CPU usage in exchange for more bandwidth set below to False
         self.compress = compress  # None -> auto
@@ -190,7 +204,8 @@ class HiveMessageBusClient(OVOSBusClient):
     def key(self, val):
         self.identity.access_key = val
 
-    def connect(self, bus=FakeBus(), protocol=None, site_id=None):
+    def connect(self, bus=FakeBus(), protocol=None, site_id=None,
+                handshake_max_retries=None):
         from hivemind_bus_client.protocol import HiveMindSlaveProtocol
 
         self.identity.site_id = site_id or self.identity.site_id
@@ -208,9 +223,15 @@ class HiveMessageBusClient(OVOSBusClient):
                 self.protocol.site_id = self.identity.site_id
 
         LOG.info("Connecting to Hivemind")
-        self.run_in_thread()
+        # bind BEFORE opening the websocket so the server's initial cleartext
+        # HELLO + HANDSHAKE parameter payloads are never missed — protocol v3
+        # needs them for Noise prologue binding (HIVEMIND-CRYPTO-1 §3.4.3)
         self.protocol.bind(bus)
-        self.wait_for_handshake()
+        self.run_in_thread()
+        # None retries forever (legacy behaviour); pass a bound so a failed
+        # handshake (e.g. wrong password on protocol v3) fails fast instead
+        # of blocking connect() indefinitely
+        self.wait_for_handshake(max_retries=handshake_max_retries)
 
     def on_open(self, *args):
         """
@@ -224,20 +245,44 @@ class HiveMessageBusClient(OVOSBusClient):
         self.retry = 5
 
     def on_error(self, *args):
+        self.connected_event.clear()
         self.handshake_event.clear()
         self.crypto_key = None
+        self.noise_transport = None
         super().on_error(*args)
 
     def on_close(self, *args):
+        self.connected_event.clear()
         self.handshake_event.clear()
         self.crypto_key = None
+        self.noise_transport = None
         super().on_close(*args)
 
-    def wait_for_handshake(self, timeout=5):
-        self.handshake_event.wait(timeout=timeout)
-        if not self.handshake_event.is_set():
-            self.protocol.start_handshake()
-            self.wait_for_handshake()
+    def wait_for_handshake(self, timeout=5, max_retries=None):
+        """
+        Waits for the HiveMind handshake to complete.
+
+        By default this waits for reconnect forever. Pass ``max_retries`` to
+        bound the wait for tests or command-line tools that need a hard fail.
+
+        Parameters:
+            timeout (float): Number of seconds to wait for each handshake or connection attempt before retrying.
+            max_retries (int | None): Number of reconnect/handshake retries;
+                                      ``None`` means retry forever.
+        """
+        attempts = 0
+        while not self.handshake_event.is_set():
+            self.handshake_event.wait(timeout=timeout)
+            if self.handshake_event.is_set():
+                return
+            if max_retries is not None and attempts >= max_retries:
+                raise RuntimeError("timed out waiting for handshake")
+            attempts += 1
+            if self.connected_event.is_set():
+                self.protocol.start_handshake()
+            else:
+                LOG.warning("Can't start handshake because websocket connection is not yet open...")
+                self.connected_event.wait(timeout=timeout)
 
     @staticmethod
     def build_url(key, host='127.0.0.1', port=5678,
@@ -257,13 +302,20 @@ class HiveMessageBusClient(OVOSBusClient):
 
     def run_forever(self):
         self.started_running = True
+        run_options = self._websocket_keepalive_options()
         if self.allow_self_signed:
-            self.client.run_forever(sslopt={
+            run_options["sslopt"] = {
                 "cert_reqs": ssl.CERT_NONE,
                 "check_hostname": False,
-                "ssl_version": ssl.PROTOCOL_TLS_CLIENT})
-        else:
-            self.client.run_forever()
+                "ssl_version": ssl.PROTOCOL_TLS_CLIENT}
+        self.client.run_forever(**run_options)
+
+    def _websocket_keepalive_options(self):
+        return websocket_keepalive_options(
+            ping_interval=self.websocket_ping_interval,
+            ping_timeout=self.websocket_ping_timeout,
+            disabled_interval_value=0,
+        )
 
     # event handlers
     def on_message(self, *args):
@@ -271,7 +323,23 @@ class HiveMessageBusClient(OVOSBusClient):
             message = args[0]
         else:
             message = args[1]
-        if self.crypto_key:
+        if self.noise_transport is not None:
+            # protocol v3: every post-handshake message is a Noise transport
+            # message; there is no cleartext v3 session (CRYPTO-1 §3.4.5)
+            if not isinstance(message, bytes):
+                LOG.error("dropping non-Noise message received on a "
+                          "protocol v3 session")
+                return
+            try:
+                message = self.noise_transport.decrypt_frame(message)
+            except NoiseTransportFailed:
+                # tampered / replayed / out-of-order — MUST reject; the
+                # receive counter is now out of sync so the session is dead
+                LOG.exception("rejecting invalid Noise transport message, "
+                              "closing connection")
+                self.close()
+                return
+        elif self.crypto_key:
             # handle binary encryption
             if isinstance(message, bytes):
                 message = decrypt_bin(self.crypto_key, message, cipher=self.cipher)
@@ -353,12 +421,12 @@ class HiveMessageBusClient(OVOSBusClient):
             message = HiveMessage(msg_type=HiveMessageType.BUS,
                                   payload=message)
         if not self.connected_event.is_set():
-            LOG.warning("hivemind connection not ready")
+            LOG.warning("hivemind connection not ready!")
             if not self.connected_event.wait(10):
                 if not self.started_running:
                     raise ValueError('You must execute run_forever() '
                                      'before emitting messages')
-                self.connected_event.wait()
+                raise RuntimeError(f"Can not send messages before opening the websocket connection. Failed to emit : {message.serialize()}")
 
         try:
             # auto inject context for proper routing, this is confusing for
@@ -394,13 +462,22 @@ class HiveMessageBusClient(OVOSBusClient):
                                        compressed=self.compress,
                                        binary_type=binary_type,
                                        hivemeta=message.metadata)
-                if self.crypto_key:
+                if self.noise_transport is not None:
+                    # protocol v3: Noise transport CipherState (replay
+                    # resistant sequential nonces) replaces the v2 AEAD
+                    ws_payload = self.noise_transport.encrypt_frame(bitstr.bytes)
+                elif self.crypto_key:
                     ws_payload = encrypt_bin(self.crypto_key, bitstr.bytes, cipher=self.cipher)
                 else:
                     ws_payload = bitstr.bytes
                 self.client.send(ws_payload, ABNF.OPCODE_BINARY)
             else:
                 ws_payload = serialize_message(message)
+                if self.noise_transport is not None:
+                    # v3 sessions are always encrypted, HELLO included
+                    ws_payload = self.noise_transport.encrypt_frame(ws_payload)
+                    self.client.send(ws_payload, ABNF.OPCODE_BINARY)
+                    return
                 if self.crypto_key:
                     ws_payload = encrypt_as_json(self.crypto_key, ws_payload,
                                                  cipher=self.cipher, encoding=self.json_encoding)
@@ -524,13 +601,17 @@ class HiveMessageBusClient(OVOSBusClient):
 
     # targeted messages for nodes, asymmetric encryption
     def emit_intercom(self, message: Union[MycroftMessage, HiveMessage],
-                      pubkey: Union[str, bytes, RSA.RsaKey]):
+                      pubkey: Union[str, bytes, 'RSA.RsaKey']):
+        """Send an INTERCOM message using hybrid encryption.
 
-        encrypted_message = encrypt_RSA(pubkey, message.serialize())
+        Generates a random AES-256 key, encrypts the payload with AES-GCM,
+        then RSA-encrypts only the AES key with the target's public key.
+        The ciphertext is signed with this node's private key.
 
-        # sign message
+        Args:
+            message: The message to send.
+            pubkey: RSA public key of the target peer.
+        """
         private_key = load_RSA_key(self.identity.private_key)
-        signature = sign_RSA(private_key, encrypted_message)
-
-        self.emit(HiveMessage(HiveMessageType.INTERCOM, payload={"ciphertext": pybase64.b64encode(encrypted_message),
-                                                                 "signature": pybase64.b64encode(signature)}))
+        envelope = hybrid_encrypt(pubkey, message.serialize(), sign_key=private_key)
+        self.emit(HiveMessage(HiveMessageType.INTERCOM, payload=envelope))
