@@ -5,6 +5,8 @@ import time
 from typing import List, Dict, Callable, Union, Optional
 
 import pybase64
+
+from hivemind_bus_client.noise import NoiseTransportFailed
 import requests
 from Cryptodome.PublicKey import RSA
 from ovos_bus_client import Message as MycroftMessage, MessageBusClient as OVOSBusClient
@@ -74,6 +76,10 @@ class HiveMindHTTPClient(threading.Thread):
         self._host = host
         self.init_identity()
         self.crypto_key = crypto_key
+        # protocol v3: set by HiveMindSlaveProtocol.receive_noise_handshake()
+        # once the Noise session is up, cleared by _abort_noise(); every
+        # message after that point goes through it in both directions
+        self.noise_transport = None
         self.allow_self_signed = self_signed
         self.share_bus = share_bus
         self.handshake_event = threading.Event()
@@ -182,7 +188,29 @@ class HiveMindHTTPClient(threading.Thread):
                                "call 'hivemind-client set-identity'")
 
     def on_message(self, message: Union[bytes, str]):
-        if self.crypto_key:
+        # getattr: subclasses and tests build clients without __init__
+        noise_transport = getattr(self, "noise_transport", None)
+        if noise_transport is not None:
+            # protocol v3: every post-handshake message is a Noise transport
+            # frame -- over HTTP it arrives through the binary queue as
+            # bytes; there is no cleartext v3 session (CRYPTO-1 §3.4.5)
+            if not isinstance(message, bytes):
+                LOG.error("dropping non-Noise message received on a "
+                          "protocol v3 session")
+                return
+            try:
+                message = noise_transport.decrypt_frame(message)
+            except NoiseTransportFailed:
+                # tampered / replayed / out-of-order: the receive counter
+                # is out of sync, so the session is dead
+                LOG.exception("rejecting invalid Noise transport message, "
+                              "disconnecting")
+                self.close_connection()
+                return
+            if message is None:
+                # a chunk of a multi-frame message, buffered for reassembly
+                return
+        elif self.crypto_key:
             # handle binary encryption
             if isinstance(message, bytes):
                 message = decrypt_bin(self.crypto_key, message, cipher=self.cipher)
@@ -376,6 +404,18 @@ class HiveMindHTTPClient(threading.Thread):
                     raise
                 LOG.warning(f"sending {message.msg_type} as a text frame: {e}")
 
+        noise_transport = getattr(self, "noise_transport", None)
+        if noise_transport is not None:
+            # protocol v3: the Noise transport CipherState replaces the v2
+            # AEAD, HELLO included; send_message chunks an oversize payload
+            # transparently, one POST per frame. Without this branch every
+            # message left in the clear and a 5.x listener closed the
+            # session on the first one.
+            noise_transport.send_message(
+                bitstr.bytes if bitstr is not None else serialize_message(message),
+                self._send_noise_frame)
+            return
+
         if bitstr is not None:
             if self.crypto_key:
                 payload = encrypt_bin(self.crypto_key, bitstr.bytes, cipher=self.cipher)
@@ -391,6 +431,38 @@ class HiveMindHTTPClient(threading.Thread):
         return requests.post(url, data={"message": payload},
                              params={"authorization": self.auth},
                              timeout=self.http_timeout)
+
+    def _send_noise_frame(self, frame: bytes) -> None:
+        """POST one Noise transport frame.
+
+        HTTP has no binary opcode, so the frame travels base64-encoded and
+        flagged ``binary=1``; the listener decodes it back to the bytes that
+        ``HiveMindClientConnection.decode`` requires on a v3 session.
+        """
+        response = requests.post(
+            f"{self.base_url}/send_message",
+            data={"message": pybase64.b64encode(frame).decode("utf-8"),
+                  "binary": "1"},
+            params={"authorization": self.auth},
+            timeout=self.http_timeout)
+        if not response.ok:
+            # the send counter has already advanced for this frame; the
+            # session cannot be resynchronised, so say so loudly
+            raise ConnectionError(
+                f"HiveMind rejected a Noise transport frame: HTTP {response.status_code}")
+
+    def close_connection(self):
+        """Release a session that has become unusable.
+
+        ``HiveMindSlaveProtocol._abort_noise`` calls this on the bound client
+        after a failed or tampered Noise exchange (it used to raise
+        AttributeError here). The websocket client closes its socket; the
+        HTTP session is released so the next ``connect()`` starts clean.
+        """
+        try:
+            self.disconnect()
+        except Exception:
+            LOG.exception("failed to release the aborted HTTP session")
 
     # targeted messages for nodes, asymmetric encryption
     def emit_intercom(self, message: Union[MycroftMessage, HiveMessage],
@@ -466,6 +538,12 @@ class HiveMindHTTPClient(threading.Thread):
                                  timeout=self.http_timeout)
         self.connected.clear()
         self.handshake_event.clear()
+        # the next session starts from a fresh handshake; a stale transport
+        # would encrypt its HELLO against a CipherState the server dropped
+        self.noise_transport = None
+        protocol = getattr(self, "protocol", None)
+        if protocol is not None and hasattr(protocol, "reset_connection_state"):
+            protocol.reset_connection_state()
         return response.json()
 
     def get_messages(self) -> List[str]:
