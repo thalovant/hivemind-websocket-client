@@ -23,7 +23,8 @@ from hivemind_bus_client.noise import (NOISE_SUPPORTED, PROTOCOL_V3,
                                        NoiseTransport, NoiseHandshakeFailed,
                                        build_prologue, canonical_json,
                                        noise_protocol_name, select_noise_options,
-                                       start_noise_handshake)
+                                       start_noise_handshake,
+                                       forget_cached_psk)
 from poorman_handshake import HandShake, PasswordHandShake
 from poorman_handshake.asymmetric.utils import load_RSA_key
 
@@ -390,6 +391,12 @@ class HiveMindSlaveProtocol:
             # fails cryptographically at handshake time (§3.4.3)
             LOG.exception("protocol v3 Noise handshake FAILED "
                           "(wrong password or tampered negotiation)")
+            # The PSK is one of the things this message authenticates, so the
+            # rejection may mean the cached key was derived from a password
+            # that has since been rotated. Drop it, so the next attempt
+            # derives from the current one instead of failing the same way.
+            forget_cached_psk(self.identity.noise_key,
+                              self.internal_protocol.node_id)
             self._abort_noise("Noise handshake authentication failure")
             return
 

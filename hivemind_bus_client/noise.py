@@ -19,7 +19,6 @@ the ``poorman_handshake.noise`` primitive:
 Protocol version 2 and below are untouched: this module is only entered when
 both peers negotiate version 3.
 """
-import hashlib
 import json
 import os
 import threading
@@ -184,23 +183,14 @@ class NoiseTransport:
         raise NoiseTransportFailed(f"unknown v3 frame marker: {marker!r}")
 
 
-#: Cached password-to-PSK derivations, beside the static key.
+#: Cached pre-shared keys, beside the static key.
+#:
+#: Only the key is stored. A fingerprint of the password would make rotation
+#: cheap to detect, but it would also put a fast hash of the password in the
+#: same file as the key it protects -- and a fast hash is exactly the offline
+#: oracle argon2id exists to deny. A rotated password is noticed when the hub
+#: rejects the stale key.
 NOISE_PSK_FILENAME = "noise_psks.json"
-
-
-def psk_password_verifier(password: Union[str, bytes]) -> str:
-    """Fingerprint the password a cached PSK came from.
-
-    A rotated password no longer matches, so the stale key is re-derived
-    instead of being offered to the hub -- which refuses a wrong PSK exactly
-    as it refuses a wrong password, making the cause hard to see.
-
-    A hash, never the password itself, and it never leaves the machine: the
-    identity file already holds the password on the same host.
-    """
-    if isinstance(password, str):
-        password = password.encode("utf-8")
-    return hashlib.sha256(b"thalovant-psk-verifier:" + password).hexdigest()
 
 
 def _psk_cache_path(key_path: Optional[str]) -> Optional[str]:
@@ -223,24 +213,20 @@ def _read_psk_cache(path: str) -> Dict[str, Any]:
     return cache if isinstance(cache, dict) else {}
 
 
-def load_cached_psk(key_path: Optional[str], node_id: str,
-                    verifier: str) -> Optional[bytes]:
-    """The stored PSK for ``node_id``, or None when it cannot be used."""
+def load_cached_psk(key_path: Optional[str], node_id: str) -> Optional[bytes]:
+    """The stored PSK for ``node_id``, or None when there is none."""
     path = _psk_cache_path(key_path)
     if not path or not node_id:
         return None
-    entry = _read_psk_cache(path).get(node_id)
-    if not isinstance(entry, dict) or entry.get("verifier") != verifier:
-        return None
     try:
-        psk = bytes.fromhex(str(entry.get("psk", "")))
+        psk = bytes.fromhex(str(_read_psk_cache(path).get(node_id, "")))
     except ValueError:
         return None
     return psk or None
 
 
-def save_cached_psk(key_path: Optional[str], node_id: str, psk: bytes,
-                    verifier: str) -> None:
+def save_cached_psk(key_path: Optional[str], node_id: str,
+                    psk: bytes) -> None:
     """Persist a derived PSK so the next connection skips argon2id.
 
     Best effort: the cache is an optimisation, so failing to write it must
@@ -254,10 +240,9 @@ def save_cached_psk(key_path: Optional[str], node_id: str, psk: bytes,
         if directory:
             os.makedirs(directory, mode=0o700, exist_ok=True)
         cache = _read_psk_cache(path)
-        entry = {"psk": psk.hex(), "verifier": verifier}
-        if cache.get(node_id) == entry:
+        if cache.get(node_id) == psk.hex():
             return
-        cache[node_id] = entry
+        cache[node_id] = psk.hex()
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(cache, handle, indent=2, sort_keys=True)
             handle.write("\n")
@@ -312,11 +297,10 @@ def start_noise_handshake(initiator: bool,
     # keeps its own bounded LRU instead.
     psk = None
     if initiator and derive_psk is not None:
-        verifier = psk_password_verifier(password)
-        psk = load_cached_psk(key_path, node_id, verifier)
+        psk = load_cached_psk(key_path, node_id)
         if psk is None:
             psk = derive_psk(password, node_id=node_id)
-            save_cached_psk(key_path, node_id, psk, verifier)
+            save_cached_psk(key_path, node_id, psk)
 
     try:
         return NoiseHandShake(
@@ -331,3 +315,24 @@ def start_noise_handshake(initiator: bool,
         )
     except Exception as e:
         raise NoiseHandshakeFailed(f"failed to initialize {name}: {e}") from e
+
+
+def forget_cached_psk(key_path: Optional[str], node_id: str) -> None:
+    """Drop a stored key.
+
+    Called when the hub rejects the key we offered, which is how a rotated
+    password is noticed: the next attempt derives from the current one.
+    """
+    path = _psk_cache_path(key_path)
+    if not path or not node_id:
+        return
+    try:
+        cache = _read_psk_cache(path)
+        if cache.pop(node_id, None) is None:
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        LOG.debug("could not update the Noise PSK cache at %s", path)
